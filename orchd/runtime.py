@@ -184,6 +184,19 @@ def _bin(name, env_var, *, home=None, env=None, which=None):
     return str(fallback)
 
 
+def open_windows_terminal(command, *, cwd=None, env=None, tracked=False):
+    """Open `command` in a new visible window: Windows Terminal when installed, else a new console.
+    Closing the window ends only this viewer process, never the worker it attaches to."""
+    if not Path(command[0]).is_file() and not shutil.which(command[0]):
+        raise FileNotFoundError(f"viewer program not found: {command[0]}")
+    terminal = shutil.which("wt.exe")
+    if terminal and not tracked:
+        args = [terminal, "-w", "new"] + (["-d", str(cwd)] if cwd else [])
+        return subprocess.Popen([*args, *command], cwd=cwd, env=env).pid
+    else:
+        return subprocess.Popen(command, cwd=cwd, env=env, creationflags=subprocess.CREATE_NEW_CONSOLE).pid
+
+
 class UDSWriteUncertain(OSError):
     """A frame write failed; the peer may have received some or all of it."""
 
@@ -253,11 +266,12 @@ class Runtime:
             proc = psutil.Process(int(pid))
             if worktree is None:
                 worktree = (environ_of(proc) or {}).get("ORCHD_WORKTREE")
-            record = json.dumps(dict(pid=proc.pid, birth=proc.create_time(), pgid=os.getpgid(proc.pid),
+            record = json.dumps(dict(pid=proc.pid, birth=proc.create_time(),
+                                     pgid=proc.pid if os.name == "nt" else os.getpgid(proc.pid),
                                      worktree=str(Path(worktree).resolve()) if worktree else None))
             path = self._identity_file(pid)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(record)
+            path.write_text(record, encoding="utf-8")
             cutoff = time.time() - 14 * 86400
             for old in path.parent.glob("*.json"):
                 if (old != path and re.fullmatch(r"[0-9]+\.json", old.name)
@@ -634,7 +648,7 @@ class Runtime:
         mcp.write_text(json.dumps({"mcpServers": {"orchd": {
             "command": executable, "args": [*args, "mcp"], "env": mcp_env(orch_id)}}}), encoding="utf-8")
         try:
-            agents = (orch_home / "AGENTS.md").read_text()
+            agents = (orch_home / "AGENTS.md").read_text(encoding="utf-8")
         except OSError:
             agents = ""
         prompt = (f"You are an orchd Orch. Your orch id is {orch_id}. "
@@ -711,7 +725,7 @@ class Runtime:
         if not files:
             return None
         seen = {}
-        for line in files[0].read_text(errors="replace").splitlines():
+        for line in files[0].read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 entry = json.loads(line)
             except ValueError:
@@ -771,7 +785,7 @@ class Runtime:
 
     def _read_identity(self, pid):
         try:
-            record = json.loads(self._identity_file(pid).read_text())
+            record = json.loads(self._identity_file(pid).read_text(encoding="utf-8"))
             return record if isinstance(record, dict) and record.get("pid") == int(pid) else None
         except (OSError, ValueError, TypeError):
             return None
@@ -784,15 +798,18 @@ class Runtime:
 
         Ownership never comes from a command line. A turn orchd started has a record (pid, birth, pgid, worktree)
         written at spawn: a pid whose birth differs was reused; a foreign worktree cannot authorize this stop.
-        Without ownership in the record (an older turn) the process must carry this task's ORCHD_WORKTREE mark and lead its own group. Nothing is signalled through killpg, so a member of the
-        group that is not provably ours is never touched."""
+        On Windows only a matching spawn identity authorizes a direct stop; missing or unowned records
+        fall through to the account-and-mark-checked cleanup in stop_task_worker. On POSIX, without ownership
+        in the record (an older turn) the process must carry this task's ORCHD_WORKTREE mark and lead its own
+        group. Nothing is signalled through killpg, so a member that is not provably ours is never touched."""
         def unknown(why):
             return RuntimeError(f"codex worker {pid} not confirmed stopped: {why}")
         try:
             proc = psutil.Process(int(pid))
             if proc.status() == psutil.STATUS_ZOMBIE:
                 return []
-            birth, pgid = proc.create_time(), os.getpgid(proc.pid)
+            birth = proc.create_time()
+            pgid = proc.pid if os.name == "nt" else os.getpgid(proc.pid)
         except (psutil.NoSuchProcess, ProcessLookupError, ValueError):
             return []
         except (psutil.AccessDenied, OSError) as e:
@@ -800,13 +817,15 @@ class Runtime:
         mark = str(Path(marks[0]).resolve()) if marks and marks[0] else None
         record = self._read_identity(pid)
         try:
+            if os.name == "nt" and (proc.pid == os.getpid() or not record or not record.get("worktree")):
+                return []  # No Windows groups: only saved task identities authorize this direct stop.
             if record:
                 if abs(float(record.get("birth", 0)) - birth) > 0.01:
                     return []  # same pid, different process
                 owner = record.get("worktree")
                 if owner and (not mark or owner != mark):
                     return []  # a later task overwrote this pid's record; never borrow its identity
-                if owner and (pgid != proc.pid or record.get("pgid") != pgid):
+                if os.name != "nt" and owner and (pgid != proc.pid or record.get("pgid") != pgid):
                     raise unknown("not an owned process-group leader; stop refused")
             if not record or not record.get("worktree"):
                 # Legacy records prove birth, but not task ownership. Require the task's environment mark too.
@@ -883,7 +902,7 @@ class Runtime:
         pid = self.spawn(self.codex_turn([self.codex, "exec", *CODEX_FLAGS, "-m", model, "-C", worktree, prompt], log),
                          worktree, log)
         for _ in range(150):
-            for line in Path(log).read_text(errors="replace").splitlines() if self.exists(log) else []:
+            for line in Path(log).read_text(encoding="utf-8", errors="replace").splitlines() if self.exists(log) else []:
                 try:
                     event = json.loads(line)
                 except ValueError:
@@ -897,7 +916,7 @@ class Runtime:
             self.stop_codex(pid, (worktree,))
         finally:
             cleanup_processes(worktree, task_processes(worktree))
-        raise RuntimeError("codex exec started no thread: " + Path(log).read_text(errors="replace")[-500:]
+        raise RuntimeError("codex exec started no thread: " + Path(log).read_text(encoding="utf-8", errors="replace")[-500:]
                            if self.exists(log) else "codex exec wrote no log")
 
     def resume_codex_worker(self, worktree, log, thread, text, model):
@@ -920,7 +939,7 @@ class Runtime:
         if not files:
             return None
         total, turns = None, 0
-        for line in files[0].read_text(errors="replace").splitlines():
+        for line in files[0].read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 payload = json.loads(line).get("payload") or {}
             except (ValueError, AttributeError):
@@ -1003,12 +1022,7 @@ class Runtime:
             env["PYTHONPATH"] = package_root + os.pathsep + env.get("PYTHONPATH", "")
             command = [sys.executable, "-P", "-m", "orchd.app_worker", "viewer",
                        database, task["id"], task["generation"]]
-            terminal = shutil.which("wt.exe")
-            if terminal:
-                subprocess.Popen([terminal, "-w", "new", *command], cwd=task["worktree"], env=env)
-            else:
-                subprocess.Popen(command, cwd=task["worktree"], env=env,
-                                 creationflags=subprocess.CREATE_NEW_CONSOLE)
+            open_windows_terminal(command, cwd=task["worktree"], env=env)
             return
         self.run(["open", "-na", "Ghostty.app", "--args", f"--working-directory={task['worktree']}", "-e",
                   "/usr/bin/env", f"PYTHONPATH={package_root}", sys.executable, "-P", "-m", "orchd.app_worker",
@@ -1016,6 +1030,9 @@ class Runtime:
                  timeout=30, env=worker_env(task["worktree"]))
 
     def open_codex_viewer(self, worktree, thread):
+        if os.name == "nt":
+            # The task mark lets close find this viewer: Windows has no process group to stop it by.
+            return open_windows_terminal([self.codex, "resume", thread], cwd=worktree, env=worker_env(worktree), tracked=True)
         self.run(["open", "-na", "Ghostty.app", "--args", f"--working-directory={worktree}", "-e",
                   self.codex, "resume", thread], timeout=30)
 
@@ -1023,5 +1040,10 @@ class Runtime:
     def wake_orch(self, codex_bin, thread, text):
         self.run([codex_bin, "queue", "--thread", thread, "--message", text], timeout=60)
 
-    def open_viewer(self, job):
+    def open_viewer(self, job, worktree=None):
+        """`worktree` is given for a task's worker (not the Orch): on Windows it marks the viewer so close can
+        stop it, as there is no process group to stop it by."""
+        if os.name == "nt":
+            return open_windows_terminal([self.claude, "attach", job], cwd=worktree,
+                                         env=worker_env(worktree) if worktree else None, tracked=bool(worktree))
         self.run(["open", "-na", "Ghostty.app", "--args", "-e", self.claude, "attach", job], timeout=30)

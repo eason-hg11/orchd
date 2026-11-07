@@ -62,18 +62,12 @@ def stop_identity(raw, grace=2):
         return
     data = json.loads(raw)
     if os.name == 'nt':
-        # Capture descendants before terminating the root; psutil verifies PID birth time.
-        descendants = proc.children(recursive=True)
-        for child in reversed(descendants):
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
+        # Only the recorded identity is authorized; sweep marked children separately.
         try:
             proc.terminate()
         except psutil.NoSuchProcess:
             pass
-        _, alive = psutil.wait_procs([proc, *descendants], timeout=grace)
+        _, alive = psutil.wait_procs([proc], timeout=grace)
         for child in alive:
             try:
                 child.kill()
@@ -145,23 +139,36 @@ def stop(con, task):
     # Cleanup uses recorded process identities, never the vanished/untrusted IPC path.
     if os.name == 'nt':
         from . import windows_job
+        receipt = None
         # Verify the supervisor identity before opening the generation-specific job.
         supervisor = process(task['supervisor_identity'])
         if supervisor is None:
             if process(task['server_identity']) is not None:
                 raise RuntimeError('server survives without its owning job; stop refused')
-            return None
-        if not windows_job.terminate(task['generation'], supervisor):
-            if process(task['supervisor_identity']) is None and process(task['server_identity']) is None:
-                return None
+        elif windows_job.terminate(task['generation'], supervisor):
+            for raw in (task['supervisor_identity'], task['server_identity']):
+                deadline = time.monotonic() + 5
+                while process(raw) is not None and time.monotonic() < deadline:
+                    time.sleep(.05)
+                if process(raw) is not None:
+                    raise RuntimeError('worker job not confirmed stopped')
+            receipt = {'terminated_job': task['generation']}
+        elif process(task['supervisor_identity']) is not None or process(task['server_identity']) is not None:
             raise RuntimeError('worker job unavailable; stop refused')
-        for raw in (task['supervisor_identity'], task['server_identity']):
-            deadline = time.monotonic() + 5
-            while process(raw) is not None and time.monotonic() < deadline:
-                time.sleep(.05)
-            if process(raw) is not None:
-                raise RuntimeError('worker job not confirmed stopped')
-        return {'terminated_job': task['generation']}
+        # Viewers and processes that escaped the job (wt-launched viewers, WSL shells) are outside it: stop
+        # registered viewers by identity, then sweep what still carries this task's ORCHD_WORKTREE mark.
+        viewers = [r['identity'] for r in con.execute(
+            'SELECT identity FROM worker_viewers WHERE task_id=? AND generation=?',
+            (task['id'], task['generation'])).fetchall()] if con is not None else []
+        for raw in viewers:
+            stop_identity(raw)
+        if any(process(raw) is not None for raw in viewers):
+            raise RuntimeError('worker viewer not confirmed stopped')
+        worktree = task['worktree'] if 'worktree' in task.keys() else None
+        swept = cleanup_processes(worktree, {}) if worktree else None
+        if swept:
+            receipt = {**(receipt or {}), 'escaped': swept}
+        return receipt
     roots=[p for p in (process(task['supervisor_identity']), process(task['server_identity'])) if p]
     captured = task_processes(task['worktree'], roots) if task['worktree'] else {}
     viewers = con.execute('SELECT identity FROM worker_viewers WHERE task_id=? AND generation=?',
@@ -185,7 +192,7 @@ def start(con, rt, task, prompt, model, pending=(), brief=None):
     make_private(directory)
     database = con.execute('PRAGMA database_list').fetchone()[2]
     spec = dict(prompt=prompt, model=model, brief=brief, pending=[r['id'] for r in pending])
-    (directory/'start.json').write_text(json.dumps(spec))
+    (directory/'start.json').write_text(json.dumps(spec), encoding='utf-8')
     (directory/'start.json').chmod(0o600)
     store.update_task(con, task['id'], backend=BACKEND, generation=generation,
                       endpoint=str(directory/'app.sock'), control_endpoint=str(directory/'control.sock'),
@@ -193,9 +200,10 @@ def start(con, rt, task, prompt, model, pending=(), brief=None):
                       turn_state='starting', last_completed_turn=None, session_id=None, socket=None,
                       model=model, job_id=None)
     env = worker_env(task['worktree'])
+    env['PYTHONIOENCODING'] = 'utf-8'
     # Use the launching package; -P excludes the worktree while honoring PYTHONPATH.
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get('PYTHONPATH','')
-    with open(directory/'supervisor.log', 'a') as out:
+    with open(directory/'supervisor.log', 'a', encoding='utf-8') as out:
         child = subprocess.Popen([background_python(), '-P', '-m', 'orchd.app_worker', 'supervise', database,
                                   task['id'], generation], cwd=task['worktree'], env=env,
                                  stdin=subprocess.DEVNULL, stdout=out, stderr=out, **detached_options())
@@ -215,7 +223,7 @@ def start(con, rt, task, prompt, model, pending=(), brief=None):
             if child.poll() is not None:
                 break
             time.sleep(.05)
-        reason = (directory/'supervisor.log').read_text()[-1200:].strip()
+        reason = (directory/'supervisor.log').read_text(encoding='utf-8', errors='replace')[-1200:].strip()
         if not reason:
             reason = (f'supervisor exited with code {child.returncode}' if child.poll() is not None
                       else 'supervisor did not become ready within 35 seconds')
@@ -540,7 +548,7 @@ class Supervisor:
         task = self.task()
         validate(task)
         directory=Path(task['endpoint']).parent
-        spec=json.loads((directory/'start.json').read_text())
+        spec=json.loads((directory/'start.json').read_text(encoding='utf-8'))
         (directory/'start.json').unlink()
         signal.signal(signal.SIGTERM,lambda *_:setattr(self,'stopping',True))
         signal.signal(signal.SIGINT,lambda *_:setattr(self,'stopping',True))
