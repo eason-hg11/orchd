@@ -394,9 +394,8 @@ class CodexStopTest(unittest.TestCase):
             argv = [str(script)]
         pid = self.rt.spawn(argv, str(self.wt), str(self.root / "log"))
         self.addCleanup(lambda: kill_turn(pid) if self.rt.pid_alive(pid) else None)
-        for _ in range(100):
-            if pidfile.exists() and pidfile.read_text().strip():
-                break
+        deadline = time.monotonic() + 30  # two interpreter starts; slow on a loaded Windows host
+        while not (pidfile.exists() and pidfile.read_text().strip()) and time.monotonic() < deadline:
             time.sleep(0.05)
         foreign = int(pidfile.read_text())
         self.addCleanup(lambda: kill_pid(foreign) if psutil.pid_exists(foreign) else None)
