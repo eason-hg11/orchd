@@ -380,13 +380,16 @@ class CodexStopTest(unittest.TestCase):
     def test_recorded_turn_is_stopped_but_a_foreign_marked_descendant_survives(self):
         pidfile = self.root / "child.pid"
         if WINDOWS:  # no shebang scripts there: the same turn as a Python leader
+            # A venv python.exe is a launcher that runs the real interpreter as a second process, so killing the
+            # recorded pid would leave that one holding the log open; start the base interpreter directly.
+            python = getattr(sys, "_base_executable", sys.executable)
             script = self.root / "turn.py"
             script.write_text("import os, subprocess, sys, time\n"
                               "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
                               "                         env=dict(os.environ, ORCHD_WORKTREE='/some/other/worktree'))\n"
                               f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
                               "time.sleep(120)\n")
-            argv = [sys.executable, str(script)]
+            argv = [python, str(script)]
         else:
             script = self.root / "turn.sh"
             script.write_text(f'#!/bin/sh\nORCHD_WORKTREE=/some/other/worktree {sys.executable} -c "import time; time.sleep(120)" &\necho $! > "{pidfile}"\nsleep 120\n')
