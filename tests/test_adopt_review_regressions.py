@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from orchd import core, store, watch
 from orchd.runtime import Runtime
+from tests.portability import needs_af_unix
 
 
 class IsolatedRuntime(Runtime):
@@ -115,6 +116,7 @@ class Review(unittest.TestCase):
             core.adopt(self.con, self.rt, "new", ["task"], force=True)
         self.assertEqual(self.owner(), "old")
 
+    @needs_af_unix
     def test_real_uds_routes_after_commit_later_wakes_new_only(self):
         sockpath = str(Path(self.tmp.name) / "new.sock")
         server = socket.socket(socket.AF_UNIX)

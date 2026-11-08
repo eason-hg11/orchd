@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -7,6 +8,11 @@ from pathlib import Path
 from unittest import mock
 
 from orchd import cli, doctor, paths
+from tests.portability import WINDOWS, posix_only
+
+
+def toml(path):
+    return json.dumps(str(path), ensure_ascii=False)  # how config writes a TOML string
 
 
 class ProjectSetupTest(unittest.TestCase):
@@ -19,7 +25,8 @@ class ProjectSetupTest(unittest.TestCase):
         self.config = self.home / '.config' / 'orchd' / 'config.toml'
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+        # getpass.getuser() (cli's --actor default) needs USERNAME on Windows, which has no pwd fallback.
+        self.stack.enter_context(mock.patch.dict(os.environ, {'USERNAME': 'tester'} if WINDOWS else {}, clear=True))
         self.stack.enter_context(mock.patch.object(Path, 'home', return_value=self.home))
         self.stack.enter_context(mock.patch('orchd.paths.__file__', '/opt/tools/orchd/paths.py'))
         self.stack.enter_context(mock.patch.object(doctor.Doctor, 'run_all', return_value=[]))
@@ -99,12 +106,14 @@ class ProjectSetupTest(unittest.TestCase):
         self.config.chmod(0o640)
         with mock.patch.object(cli.sys.stdin, 'isatty', return_value=True), mock.patch('builtins.input', return_value=str(self.projects)):
             self.assertEqual(cli.main(['doctor']), 0)
-        self.assertEqual(self.config.read_bytes(), f'projects_dir = "{self.projects}"\r\n'.encode() + original)
-        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.config.read_bytes(), f'projects_dir = {toml(self.projects)}\r\n'.encode() + original)
+        if not WINDOWS:  # POSIX file modes
+            self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
 
+    @posix_only("0600/0700 file modes")
     def test_prompt_creates_new_file_private(self):
         with mock.patch.object(cli.sys.stdin, 'isatty', return_value=True), mock.patch('builtins.input', return_value=str(self.projects)):
             cli.main(['doctor'])
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.config.parent.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(self.config.read_text(), f'projects_dir = "{self.projects}"\n')
+        self.assertEqual(self.config.read_text(), f'projects_dir = {toml(self.projects)}\n')

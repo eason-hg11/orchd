@@ -18,22 +18,29 @@ class Wire:
     def close(self):self.received.put('')
 
 
+def endpoint_socket():
+    """Stub the Unix socket helper RPC connects through (POSIX connect, or Winsock on Windows builds without the
+    AF_UNIX binding); the real socket path is covered by tests/test_worker_socket.py."""
+    return patch('orchd.app_transport.unix_socket.create'), patch('orchd.app_transport.unix_socket.connect')
+
+
 class TransportTest(unittest.TestCase):
     def test_unsolicited_events_do_not_consume_rpc_response(self):
         wire=Wire()
-        with patch('orchd.app_transport.socket.socket') as sock, \
+        create, connect = endpoint_socket()
+        with create as sock, connect as connected, \
              patch('websocket.create_connection',return_value=wire):
             rpc=RPC('/private/app.sock')
             self.assertEqual(rpc.call('turn/interrupt',{'threadId':'thread','turnId':'turn'}),{})
             self.assertEqual(rpc.events.get()['method'],'turn/completed')
-            sock.return_value.connect.assert_called_once_with('/private/app.sock')
+            connected.assert_called_once_with(sock.return_value, '/private/app.sock', timeout=10)
             self.assertEqual(wire.sent[1]['method'],'initialized')
             rpc.close()
 
     def test_disconnect_wakes_waiter_with_uncertainty(self):
         wire=Wire()
-        with patch('orchd.app_transport.socket.socket'),patch(
-                'websocket.create_connection',return_value=wire):
+        create, connect = endpoint_socket()
+        with create, connect, patch('websocket.create_connection',return_value=wire):
             rpc=RPC('/private/app.sock');wire.received.put('');rpc.reader.join(1)
             with self.assertRaises(ConnectionError):rpc.call('thread/read',{})
             rpc.close()
@@ -49,8 +56,8 @@ class TransportTest(unittest.TestCase):
                 else:
                     super().send(raw)
         wire = RejectingWire()
-        with patch('orchd.app_transport.socket.socket'), patch(
-                'websocket.create_connection', return_value=wire):
+        create, connect = endpoint_socket()
+        with create, connect, patch('websocket.create_connection', return_value=wire):
             rpc = RPC('/private/app.sock')
             try:
                 with self.assertRaises(RPCError) as raised:

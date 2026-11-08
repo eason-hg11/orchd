@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from orchd import core, mcp_server, store
 from orchd.runtime import WORKER_MODELS, Runtime
 from tests.test_orchd import FakeRuntime
+from tests.portability import WINDOWS
 
 
 class RetryRuntime(FakeRuntime):
@@ -96,11 +98,10 @@ class RetryRuntime(FakeRuntime):
 class RetryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.con = store.connect(Path(self.tmp.name) / "t.db")
+        self.addCleanup(lambda: self.con.close())
         self.rt = RetryRuntime()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def dispatch(self, model="sonnet"):
         t = core.dispatch(self.con, self.rt, orch_thread="thread-A", repo="demo", title="T",
@@ -362,13 +363,18 @@ class RetryReviewRegressionTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / "t.db"
         self.con = store.connect(self.db)
+        self.addCleanup(lambda: self.con.close())
         self.rt = RetryRuntime()
         self.rt.pid_alive = lambda pid: pid in self.rt.codex_live or pid in self.rt.alive_pids
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def connect(self):
+        """Another process's connection to the same database, closed before the temp dir goes."""
+        con = store.connect(self.db)
+        self.addCleanup(con.close)
+        return con
 
     def dispatch(self, model):
         t = core.dispatch(self.con, self.rt, orch_thread="thread-A", repo="demo", title="T", instructions="do it",
@@ -468,7 +474,7 @@ class RetryReviewRegressionTest(unittest.TestCase):
 
     def test_claude_answer_while_task_is_locked_is_queued_not_lost(self):
         t = self.dispatch("sonnet")
-        other = store.connect(self.db)
+        other = self.connect()
         real = store.task_delivery
         store.task_delivery = lambda con, ids, timeout=65: real(con, ids, 0.1)
         try:
@@ -600,7 +606,7 @@ class RetryReviewRegressionTest(unittest.TestCase):
         t = self.dispatch("sonnet")  # an older orchd's close: no task lock, worktree removed, status closed
 
         def close_without_lock():
-            other = store.connect(self.db)
+            other = self.connect()
             store.update_task(other, t["id"], status="closed")
             self.rt.missing.add(t["worktree"])
         self.slow("start_worker", during=close_without_lock)
@@ -628,7 +634,7 @@ class RetryReviewRegressionTest(unittest.TestCase):
 
     def test_lifecycle_step_holding_the_task_lock_blocks_retry_without_side_effects(self):
         t = self.dispatch("sonnet")  # how close (PR #14) and adopt (PR #27) hold it: same file, same helper
-        other = store.connect(self.db)
+        other = self.connect()
         with store.task_delivery(other, [t["id"]]):
             with self.assertRaises(TimeoutError):
                 core.retry(self.con, self.rt, t["id"], "sonnet", "x", lock_wait=0.2)
@@ -658,15 +664,22 @@ class RealCodexStopTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.codex = root / "bin" / "codex"
-        self.codex.parent.mkdir()
-        src = root / "sleep.c"
-        src.write_text("#include <unistd.h>\n#include <stdlib.h>\nint main(int c, char **v) {"
-                       " sleep(atoi(v[1])); return 0; }\n")
-        try:
-            subprocess.run(["cc", "-o", str(self.codex), str(src)], check=True, capture_output=True)
-        except (OSError, subprocess.CalledProcessError) as e:
-            self.skipTest(f"no C compiler for a process named codex: {e}")
+        if WINDOWS:
+            # Windows authorizes a direct Codex stop only through the spawn identity record, never the process
+            # name, so any sleeper stands in. The base interpreter, not the venv launcher, so the pid is the sleeper.
+            self.codex = [getattr(sys, "_base_executable", sys.executable), "-c",
+                          "import sys, time; time.sleep(int(sys.argv[1]))"]
+        else:
+            codex = root / "bin" / "codex"
+            codex.parent.mkdir()
+            src = root / "sleep.c"
+            src.write_text("#include <unistd.h>\n#include <stdlib.h>\nint main(int c, char **v) {"
+                           " sleep(atoi(v[1])); return 0; }\n")
+            try:
+                subprocess.run(["cc", "-o", str(codex), str(src)], check=True, capture_output=True)
+            except (OSError, subprocess.CalledProcessError) as e:
+                self.skipTest(f"no C compiler for a process named codex: {e}")
+            self.codex = [str(codex)]
         self.wt = root / "wt-task"
         self.wt.mkdir()
         self.procs = []
@@ -696,11 +709,12 @@ class RealCodexStopTest(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+        self.con.close()
         self.tmp.cleanup()
 
     def start(self, *args, record=False):
         """record=True: a turn orchd started (Runtime.spawn writes its identity); False: whatever else holds a pid."""
-        proc = subprocess.Popen([str(self.codex), "300", *args], start_new_session=True)
+        proc = subprocess.Popen([*self.codex, "300", *args], start_new_session=True)
         self.procs.append(proc)
         time.sleep(0.1)
         if record:
@@ -754,6 +768,7 @@ class RetryKeepsWorktreeTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         self.repo, self.wt = root / "demo", str(root / "wt")
         self.repo.mkdir()
@@ -772,9 +787,6 @@ class RetryKeepsWorktreeTest(unittest.TestCase):
         (Path(self.wt) / "sub").mkdir()
         self.git("init", "-q", cwd=Path(self.wt) / "sub")
 
-    def tearDown(self):
-        self.tmp.cleanup()
-
     def snapshot(self):
         return (self.git("status", "--porcelain", "--untracked-files=all"), self.git("rev-parse", "HEAD"),
                 self.git("stash", "list"), self.git("branch", "--list"), (Path(self.wt) / "a.txt").read_text(),
@@ -792,6 +804,7 @@ class RetryKeepsWorktreeTest(unittest.TestCase):
 
         rt = Rt()
         con = store.connect(Path(self.tmp.name) / "t.db")
+        self.addCleanup(con.close)
         store.create_task(con, id="t1", repo="demo", repo_path=str(self.repo), title="T", instructions="i",
                           done_when="d", orch_thread="thread-A", codex_bin="/fake/codex", model=WORKER_MODELS["sonnet"],
                           base="x", branch="orchd/t1", worktree=self.wt, job_id="job1", session_id="session1",

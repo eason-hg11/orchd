@@ -12,6 +12,7 @@ from unittest.mock import patch
 from orchd import app_worker, core, store
 from orchd.runtime import Runtime
 from tests.app_support import AppBase
+from tests.portability import WINDOWS
 
 REPO = Path(__file__).resolve().parents[1]
 FAKE = Path(__file__).parent / 'fixtures' / 'fake_app_server.py'
@@ -34,14 +35,21 @@ class IsolationBase(AppBase):
         (self.worktree / 'orchd').mkdir(parents=True)
         (self.worktree / 'orchd' / '__init__.py').write_text(SHADOW)
         self.log = self.root / 'fake.log'
-        self.fake = self.root / 'fake-codex'
-        self.fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
-        self.fake.chmod(0o700)
+        self.fake = self.root / ('fake-codex.cmd' if WINDOWS else 'fake-codex')
+        self.write_fake(f'exec "{sys.executable}" "{FAKE}" "$@"', f'"{sys.executable}" "{FAKE}" %*')
         store.update_task(self.con, self.id, codex_bin=str(self.fake), worktree=str(self.worktree))
         env = patch.dict(os.environ, {'ORCHD_HOME': str(self.root / 'state'), 'FAKE_APP_SERVER_LOG': str(self.log),
                                       'PYTHONPATH': str(REPO)})
         env.start()
         self.addCleanup(env.stop)
+
+    def write_fake(self, sh, cmd):
+        """The stand-in codex_bin: a shebang script on POSIX; on Windows a .cmd, which Popen runs through cmd.exe."""
+        if WINDOWS:
+            self.fake.write_text(f'@echo off\r\n{cmd}\r\n', newline='')
+        else:
+            self.fake.write_text(f'#!/bin/sh\n{sh}\n')
+            self.fake.chmod(0o700)
 
     def tearDown(self):
         self.stop_attempt()  # before AppBase closes the connection it needs
@@ -113,10 +121,12 @@ class SupervisorIsolationTest(IsolationBase):
         self.assertEqual(self.logged(), [])
 
     def test_startup_failure_reports_original_cause(self):
-        self.fake.write_text('#!/bin/sh\necho FIXTURE-SERVER-FAILED >&2\nexit 7\n')
+        self.write_fake('echo FIXTURE-SERVER-FAILED >&2\nexit 7', 'echo FIXTURE-SERVER-FAILED 1>&2\r\nexit /b 7')
         with self.assertRaisesRegex(RuntimeError, 'app-server startup failed:.*') as caught:
             app_worker.start(self.con, self.rt, store.get_task(self.con, self.id), 'first', 'gpt-6.1-sol')
-        self.assertIn('FileNotFoundError', str(caught.exception))
+        # The server never bound its endpoint: connecting to the missing socket file is ENOENT on POSIX, while
+        # Winsock's AF_UNIX reports WSAECONNREFUSED.
+        self.assertIn('ConnectionRefusedError' if WINDOWS else 'FileNotFoundError', str(caught.exception))
 
     def test_viewer_command_ignores_worktree_orchd(self):
         rt = Runtime()

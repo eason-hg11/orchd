@@ -13,11 +13,19 @@ class BindingFailureTest(unittest.TestCase):
     def test_cli_prints_runtime_and_os_errors_without_traceback(self):
         import contextlib
         import io
-        from orchd import cli, entry
-        with tempfile.TemporaryDirectory() as tmp:
+        from orchd import cli, entry, store
+        real_connect = store.connect
+        def connect(*args, **kwargs):
+            con = real_connect(*args, **kwargs)
+            closing.callback(con.close)
+            return con
+        # The CLI leaves its connection to process exit, and the raised error's traceback keeps it alive here;
+        # close it before the temp dir is removed (Windows cannot delete an open database).
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as closing:
             for error in (RuntimeError("socket not published"), OSError("binary missing")):
                 stderr = io.StringIO()
                 with mock.patch.dict(os.environ, {"ORCHD_HOME": tmp}), \
+                        mock.patch.object(store, "connect", side_effect=connect), \
                         mock.patch.object(entry, "binding", side_effect=error), \
                         contextlib.redirect_stderr(stderr):
                     self.assertEqual(cli.main(["binding"]), 1)

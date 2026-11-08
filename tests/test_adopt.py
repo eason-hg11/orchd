@@ -9,14 +9,13 @@ from tests.test_orchd import FakeRuntime
 class AdoptTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.con = store.connect(Path(self.tmp.name) / "t.db")
+        self.addCleanup(lambda: self.con.close())
         self.rt = FakeRuntime()
         self.rt.jobs = {"newjob": {"pid": 4242, "status": "idle"}}  # oldjob absent = confirmed dead
         store.register_orch(self.con, "old", "claude", socket="/s/old", session_id="so", job_id="oldjob")
         store.register_orch(self.con, "new", "claude", socket="/s/new", session_id="sn", job_id="newjob")
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def task(self, owner="old", repo="demo"):
         t = core.dispatch(self.con, self.rt, orch_thread=owner, repo=repo, title="T", instructions="x",

@@ -12,11 +12,14 @@ from unittest.mock import patch
 from orchd import entry, entry_attachments as attachments, paths, store
 from orchd.runtime import Runtime
 from tests import test_entry as entry_tests
+from tests.portability import posix_only
 
 BODY = entry_tests.BODY
+NO_WINDOWS_CACHE = posix_only("orchd.entry_attachments copies through dir_fd/O_NOFOLLOW/uid checks and reports unsupported_platform on Windows instead of path-based copies")
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
 
 
+@NO_WINDOWS_CACHE
 class CacheTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -312,6 +315,16 @@ class CacheTest(unittest.TestCase):
                 result = self.described(message=i)[0][0]
                 self.assertEqual(Path(result["cached_path"]).read_bytes(), content)
 
+    def test_legacy_unvalidated_manifest_is_not_advertised(self):
+        self.capture()
+        manifest = self.directory() / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data["version"] = 1
+        manifest.write_text(json.dumps(data))
+        self.assertNotIn("cached_path", self.described()[0][0])
+
+
+class ImageHeaderTest(unittest.TestCase):
     def test_truncated_unknown_and_non_heif_ftyp_headers_are_rejected(self):
         headers = [b"\x89PNG", b"plain text", b"\0\0\0\x18ftypmif1\0\0\0\0",
                    b"\0\0\0\x14ftypmp42\0\0\0\0heic", b"\0\0\0\x14ftypmif1\0\0\0\0avif"]
@@ -320,13 +333,17 @@ class CacheTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "image_extension_mismatch"):
             attachments._validate_image(b"\0\0\0\x14ftypmif1\0\0\0\0mif1", ".heic")
 
-    def test_legacy_unvalidated_manifest_is_not_advertised(self):
-        self.capture()
-        manifest = self.directory() / "manifest.json"
-        data = json.loads(manifest.read_text())
-        data["version"] = 1
-        manifest.write_text(json.dumps(data))
-        self.assertNotIn("cached_path", self.described()[0][0])
+
+@unittest.skipUnless(os.name == "nt", "Windows fail-closed path")
+class WindowsFailClosedTest(unittest.TestCase):
+    def test_windows_never_copies_and_reports_every_attachment_unavailable(self):
+        sources = [f"C:\\synthetic\\{i}.png" for i in range(12)]
+        self.assertEqual(attachments.capture("desktop", 1, sources), "unsupported_platform")
+        self.assertIsNone(attachments.capture("desktop", 1, []))
+        items, omitted = attachments.describe("desktop", 1, sources)
+        self.assertEqual((len(items), omitted), (attachments.MAX_IMAGES, 2))
+        self.assertTrue(all(i == dict(source_path=s, status="unavailable", error="unsupported_platform")
+                            for i, s in zip(items, sources)))
 
 
 class RelayAttachmentTest(unittest.TestCase):
@@ -358,6 +375,7 @@ class RelayAttachmentTest(unittest.TestCase):
     def inbox(self):
         return entry.inbox(self.con, self.orch, self.rt)["messages"][0]
 
+    @NO_WINDOWS_CACHE
     def test_copy_precedes_wake_and_original_db_body_digest_are_unchanged(self):
         self.say()
         send = self.rt.send_uds
@@ -380,6 +398,7 @@ class RelayAttachmentTest(unittest.TestCase):
         self.assertTrue(msg["body"].startswith(BODY))
         self.assertIn(msg["attachments"][0]["cached_path"], msg["body"])
 
+    @NO_WINDOWS_CACHE
     def test_deleted_source_preserves_text_and_reports_copy_failure(self):
         self.say()
         self.source.unlink()
@@ -388,6 +407,7 @@ class RelayAttachmentTest(unittest.TestCase):
         self.assertTrue(msg["body"].startswith(BODY))
         self.assertEqual(msg["attachments"][0]["error"], "source_missing")
 
+    @NO_WINDOWS_CACHE
     def test_duplicate_relay_does_not_recopy(self):
         self.say()
         with patch.object(attachments, "capture", wraps=attachments.capture) as capture:
@@ -464,6 +484,7 @@ class RelayAttachmentTest(unittest.TestCase):
         self.assertEqual(msg["attachments"][0]["status"], "unavailable")
         self.assertEqual(list((self.image_root / "attachments").glob("*/*/01.png")), [])
 
+    @posix_only("Desktop's \"Files mentioned\" wrapper carries macOS absolute paths; mentioned_images only matches /-rooted paths")
     def test_cache_failure_and_missing_rollout_still_deliver_original_text(self):
         self.say(f"# Files mentioned by the user:\n\n## example.png: {self.source}\nImage attachment: true\n\n## My request:\nsee this")
         with patch.object(attachments, "capture", return_value="cache_unavailable"):
@@ -475,6 +496,7 @@ class RelayAttachmentTest(unittest.TestCase):
 
 
 class RolloutImageTest(unittest.TestCase):
+    @posix_only("the trusted desktop temp root is a macOS /private/var/folders path")
     def test_desktop_temp_root_comes_from_os_not_tmpdir(self):
         import subprocess
         result = subprocess.CompletedProcess([], 0, stdout="/private/var/folders/ab/synthetic_user/T/\n")
@@ -504,6 +526,7 @@ class RolloutImageTest(unittest.TestCase):
             self.assertEqual(source["text"], BODY)
             self.assertEqual(source["local_images"], ["/synthetic/截圖 one.png", "/synthetic/two.png"])
 
+    @posix_only("paths.orch_images is /tmp/claude-<uid> and raises on Windows (no os.getuid)")
     def test_cache_root_uses_uid_and_configured_orch_cwd(self):
         with patch.dict(os.environ, {"ORCHD_ORCH_HOME": "/synthetic/orch home"}), patch.object(os, "getuid", return_value=123):
             root = paths.orch_images()

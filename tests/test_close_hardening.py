@@ -19,9 +19,39 @@ import psutil
 
 from orchd import core, processes, store
 from orchd.runtime import Runtime
+from tests.portability import WINDOWS, needs_symlinks, posix_only
 from tests.test_close_recovery import HookRuntime, git
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def owned_by_this_user(proc):
+    """Make a mocked psutil.Process pass processes._owned_by_us: uids on POSIX, the account name on Windows."""
+    if WINDOWS:
+        proc.username.return_value = psutil.Process().username()
+    else:
+        proc.uids.return_value = mock.Mock(real=os.getuid(), effective=os.getuid())
+
+
+OWNER_LOOKUP = "username" if WINDOWS else "uids"  # the psutil call _owned_by_us makes on this platform
+
+
+def kill_pid(pid):
+    """SIGKILL one process this test started and wait until it is gone (and has released its cwd)."""
+    try:
+        proc = psutil.Process(int(pid))
+        proc.kill()
+        proc.wait(5)
+    except psutil.NoSuchProcess:
+        pass
+
+
+def kill_turn(pid):
+    """Kill a spawned turn we started: its whole group on POSIX; Windows has no groups, so the process itself."""
+    if WINDOWS:
+        kill_pid(pid)
+    else:
+        os.killpg(int(pid), signal.SIGKILL)
 
 
 class WorktreeCase(unittest.TestCase):
@@ -53,6 +83,7 @@ class WorktreeCase(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("ORCHD_PROJECTS", None)
+        self.con.close()
         self.tmp.cleanup()
 
     def put(self, relative, text="x"):
@@ -132,7 +163,12 @@ class IgnoredFilesTest(WorktreeCase):
                     if kind == "file":
                         path.write_text("unique data")
                     else:
-                        path.symlink_to(self.repo, target_is_directory=True)
+                        try:
+                            path.symlink_to(self.repo, target_is_directory=True)
+                        except OSError as error:
+                            if getattr(error, "winerror", None) == 1314:  # ERROR_PRIVILEGE_NOT_HELD
+                                self.skipTest("this account cannot create symlinks (Windows needs Developer Mode or admin)")
+                            raise
                     try:
                         removable, reason = self.rt.worktree_state(self.wt, self.base)
                         self.assertFalse(removable, reason)
@@ -160,12 +196,14 @@ class IgnoredFilesTest(WorktreeCase):
 
 
 class PidUnknownTest(unittest.TestCase):
+    @posix_only("pid_alive probes with waitpid/kill(0); Windows uses psutil.pid_exists")
     def test_permission_denied_pid_probe_is_alive_not_dead(self):
         rt = Runtime()
         with mock.patch("orchd.runtime.os.waitpid", side_effect=ChildProcessError), \
                 mock.patch("orchd.runtime.os.kill", side_effect=PermissionError(1, "Operation not permitted")):
             self.assertTrue(rt.pid_alive(4242))
 
+    @posix_only("pid_alive probes with waitpid/kill(0); Windows uses psutil.pid_exists")
     def test_only_a_missing_pid_is_dead(self):
         rt = Runtime()
         with mock.patch("orchd.runtime.os.waitpid", side_effect=ChildProcessError), \
@@ -174,6 +212,9 @@ class PidUnknownTest(unittest.TestCase):
         with mock.patch("orchd.runtime.os.waitpid", side_effect=ChildProcessError), \
                 mock.patch("orchd.runtime.os.kill", side_effect=OSError(5, "weird")):
             self.assertTrue(rt.pid_alive(4242))
+
+    # Windows judges an unreadable process by worktree age and parent account instead (tests/test_windows_cleanup.py).
+    posix_uid_gate = posix_only("uid ownership; an unreadable environment of an own-uid process blocks")
 
     def process(self, cwd="/elsewhere"):
         proc = mock.Mock(spec=psutil.Process, pid=987654)
@@ -185,18 +226,21 @@ class PidUnknownTest(unittest.TestCase):
             proc.cwd.return_value = cwd
         return proc
 
+    @posix_uid_gate
     def test_process_with_unreadable_environ_and_cwd_blocks(self):
         proc = self.process(psutil.AccessDenied(987654))
         with mock.patch.object(processes.psutil, "process_iter", return_value=[proc]):
             with self.assertRaisesRegex(RuntimeError, "cannot inspect process 987654"):
                 processes.task_processes("/wt/demo-t1")
 
+    @posix_uid_gate
     def test_process_with_unreadable_environ_blocks_even_when_cwd_is_elsewhere(self):
         proc = self.process("/elsewhere")
         with mock.patch.object(processes.psutil, "process_iter", return_value=[proc]):
             with self.assertRaisesRegex(RuntimeError, "cannot inspect process 987654"):
                 processes.task_processes("/wt/demo-t1")
 
+    @posix_uid_gate
     def test_setuid_process_with_unreadable_environ_is_skipped(self):
         proc = self.process()
         proc.uids.return_value = mock.Mock(real=os.getuid(), effective=0)
@@ -205,6 +249,7 @@ class PidUnknownTest(unittest.TestCase):
             proc.uids.return_value.real = 501
             self.assertEqual(processes.task_processes("/wt/demo-t1"), {})
 
+    @posix_uid_gate
     def test_process_with_unreadable_uid_blocks(self):
         proc = self.process()
         proc.uids.side_effect = psutil.AccessDenied(987654)
@@ -218,7 +263,7 @@ class VanishingProcessTest(unittest.TestCase):
 
     def process(self, running):
         proc = mock.Mock(spec=psutil.Process, pid=987654)
-        proc.uids.return_value = mock.Mock(real=os.getuid(), effective=os.getuid())
+        owned_by_this_user(proc)
         proc.environ.side_effect = SystemError("returned a result with an exception set")
         proc.is_running.return_value = running
         return proc
@@ -240,7 +285,7 @@ class VanishingProcessTest(unittest.TestCase):
 
     def test_systemerror_outside_the_environ_read_is_handled_the_same_way(self):
         proc = self.process(False)
-        proc.uids.side_effect = SystemError("x")
+        getattr(proc, OWNER_LOOKUP).side_effect = SystemError("x")
         with mock.patch.object(processes.psutil, "process_iter", return_value=[proc]):
             self.assertEqual(processes.task_processes("/wt/demo-t1"), {})
         proc.is_running.return_value = True
@@ -254,10 +299,14 @@ class CodexStopTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # Cleanups run LIFO, so every process a test started (whose cwd may be in here) is gone before the
+        # directory is removed; Windows cannot delete a directory that is a live process's cwd.
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.wt = self.root / "wt-task"
         self.wt.mkdir()
         self.procs = []
+        self.addCleanup(self.stop_started)
         patcher = mock.patch.dict(os.environ, {"ORCHD_HOME": str(self.root / "home")})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -265,15 +314,14 @@ class CodexStopTest(unittest.TestCase):
         self.rt.sleep = lambda s: time.sleep(min(s, 0.05))
         self.marks = (str(self.wt), "thread-1")
 
-    def tearDown(self):
+    def stop_started(self):
         for proc in self.procs:
             if proc.poll() is None:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    kill_turn(proc.pid)
                 except OSError:
                     pass
                 proc.wait()
-        self.tmp.cleanup()
 
     def start(self, argv, env=None):
         proc = subprocess.Popen(argv, start_new_session=True, env=env or os.environ.copy(),
@@ -302,7 +350,7 @@ class CodexStopTest(unittest.TestCase):
         directory.mkdir(parents=True)
         proc = psutil.Process(other.pid)
         (directory / f"{other.pid}.json").write_text(json.dumps(
-            dict(pid=other.pid, birth=proc.create_time() - 500, pgid=os.getpgid(other.pid))))
+            dict(pid=other.pid, birth=proc.create_time() - 500, pgid=other.pid if WINDOWS else os.getpgid(other.pid))))
         self.rt.stop_task_worker("codex", str(other.pid), self.marks)
         self.assertIsNone(other.poll())
 
@@ -311,6 +359,7 @@ class CodexStopTest(unittest.TestCase):
         self.rt.stop_task_worker("codex", str(other.pid), self.marks)
         self.assertIsNone(other.poll())
 
+    @posix_only("an unrecorded pid is checked by its environment mark on POSIX; Windows stops only a saved spawn identity")
     def test_unreadable_look_alike_blocks_instead_of_guessing(self):
         other = self.look_alike()
         real = psutil.Process(other.pid)
@@ -330,27 +379,41 @@ class CodexStopTest(unittest.TestCase):
 
     def test_recorded_turn_is_stopped_but_a_foreign_marked_descendant_survives(self):
         pidfile = self.root / "child.pid"
-        script = self.root / "turn.sh"
-        script.write_text(f'#!/bin/sh\nORCHD_WORKTREE=/some/other/worktree {sys.executable} -c "import time; time.sleep(120)" &\necho $! > "{pidfile}"\nsleep 120\n')
-        script.chmod(0o755)
-        pid = self.rt.spawn([str(script)], str(self.wt), str(self.root / "log"))
-        self.addCleanup(lambda: os.killpg(int(pid), signal.SIGKILL) if self.rt.pid_alive(pid) else None)
+        if WINDOWS:  # no shebang scripts there: the same turn as a Python leader
+            script = self.root / "turn.py"
+            script.write_text("import os, subprocess, sys, time\n"
+                              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
+                              "                         env=dict(os.environ, ORCHD_WORKTREE='/some/other/worktree'))\n"
+                              f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+                              "time.sleep(120)\n")
+            argv = [sys.executable, str(script)]
+        else:
+            script = self.root / "turn.sh"
+            script.write_text(f'#!/bin/sh\nORCHD_WORKTREE=/some/other/worktree {sys.executable} -c "import time; time.sleep(120)" &\necho $! > "{pidfile}"\nsleep 120\n')
+            script.chmod(0o755)
+            argv = [str(script)]
+        pid = self.rt.spawn(argv, str(self.wt), str(self.root / "log"))
+        self.addCleanup(lambda: kill_turn(pid) if self.rt.pid_alive(pid) else None)
         for _ in range(100):
             if pidfile.exists() and pidfile.read_text().strip():
                 break
             time.sleep(0.05)
         foreign = int(pidfile.read_text())
-        self.addCleanup(lambda: os.kill(foreign, signal.SIGKILL) if psutil.pid_exists(foreign) else None)
+        self.addCleanup(lambda: kill_pid(foreign) if psutil.pid_exists(foreign) else None)
         self.rt.stop_task_worker("codex", str(pid), self.marks, wait=3)
         self.assertFalse(self.rt.pid_alive(pid))
         self.assertTrue(psutil.pid_exists(foreign), "a member of the group marked for another task was signalled")
 
     def test_recorded_turn_is_stopped_without_any_command_string_match(self):
-        script = self.root / "quiet.sh"
-        script.write_text("#!/bin/sh\nsleep 120\n")
-        script.chmod(0o755)
-        pid = self.rt.spawn([str(script)], str(self.wt), str(self.root / "log"))
-        self.addCleanup(lambda: os.killpg(int(pid), signal.SIGKILL) if self.rt.pid_alive(pid) else None)
+        if WINDOWS:  # no shebang scripts there
+            argv = [sys.executable, "-c", "import time; time.sleep(120)"]
+        else:
+            script = self.root / "quiet.sh"
+            script.write_text("#!/bin/sh\nsleep 120\n")
+            script.chmod(0o755)
+            argv = [str(script)]
+        pid = self.rt.spawn(argv, str(self.wt), str(self.root / "log"))
+        self.addCleanup(lambda: kill_turn(pid) if self.rt.pid_alive(pid) else None)
         time.sleep(0.2)
         self.rt.stop_task_worker("codex", str(pid), self.marks, wait=3)
         self.assertFalse(self.rt.pid_alive(pid))
@@ -365,7 +428,7 @@ class CodexIdentityOwnershipTest(unittest.TestCase):
             proc.create_time.return_value = 100
             proc.environ.return_value = {"ORCHD_WORKTREE": "/wt/A"}
             with mock.patch("orchd.runtime.psutil.Process", return_value=proc), \
-                    mock.patch("orchd.runtime.os.getpgid", return_value=4242), \
+                    mock.patch("orchd.runtime.os.getpgid", return_value=4242, create=True), \
                     mock.patch.object(rt, "pid_alive", return_value=True):
                 rt._record_identity(4242)
                 proc.create_time.return_value = 200
@@ -376,6 +439,7 @@ class CodexIdentityOwnershipTest(unittest.TestCase):
                 proc.kill.assert_not_called()
                 self.assertEqual(rt._codex_targets(4242, ("/wt/B",)), [proc])
 
+    @needs_symlinks
     def test_identity_expiry_keeps_live_unknown_and_non_pid_files(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, ORCHD_HOME=home):
             rt = Runtime()
@@ -402,12 +466,13 @@ class CodexIdentityOwnershipTest(unittest.TestCase):
                     raise psutil.AccessDenied(pid)
                 raise psutil.NoSuchProcess(pid)
             with mock.patch("orchd.runtime.psutil.Process", side_effect=process), \
-                    mock.patch("orchd.runtime.os.getpgid", return_value=4242):
+                    mock.patch("orchd.runtime.os.getpgid", return_value=4242, create=True):
                 rt._record_identity(4242, worktree="/wt/B")
             self.assertFalse((directory / "12.json").exists())
             for name in ("10.json", "11.json", "notes.json", "١٣.json", "14.json", "15.json", "4242.json"):
                 self.assertTrue((directory / name).exists(), name)
 
+    @posix_only("a legacy record without an owner is honoured only on POSIX; Windows requires a saved owner")
     def test_legacy_unowned_record_requires_a_matching_environment(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, ORCHD_HOME=home):
             rt = Runtime()
@@ -419,7 +484,7 @@ class CodexIdentityOwnershipTest(unittest.TestCase):
             proc.create_time.return_value = 100
             proc.environ.return_value = {"ORCHD_WORKTREE": "/wt/B"}
             with mock.patch("orchd.runtime.psutil.Process", return_value=proc), \
-                    mock.patch("orchd.runtime.os.getpgid", return_value=4242):
+                    mock.patch("orchd.runtime.os.getpgid", return_value=4242, create=True):
                 rt.stop_codex(4242, ("/wt/A",))
                 proc.terminate.assert_not_called()
                 proc.environ.return_value = {"ORCHD_WORKTREE": "/wt/A"}
@@ -429,12 +494,10 @@ class CodexIdentityOwnershipTest(unittest.TestCase):
 class StuckCloseReadOnlyTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)  # cleanups run LIFO: a connection a test registers closes first
         self.home = Path(self.tmp.name) / "home"
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("ORCHD_")}
         self.env.update(ORCHD_HOME=str(self.home), ORCHD_AUTO_MIGRATE="0", HOME=self.tmp.name)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def run_cli(self):
         return subprocess.run([sys.executable, str(ROOT / "bin" / "orchd"), "stuck-close"], env=self.env,
@@ -517,7 +580,7 @@ class StuckCloseReadOnlyTest(unittest.TestCase):
 
 class RunbookTest(unittest.TestCase):
     def test_manual_cleanup_is_a_full_checklist_with_backups_before_force(self):
-        text = (ROOT / "docs" / "runbooks" / "stuck-close.md").read_text()
+        text = (ROOT / "docs" / "runbooks" / "stuck-close.md").read_text(encoding="utf-8")
         force = text.index("$REPO worktree remove --force")
         before_force = text[:force]
         for needle in ("--ignored", "branch -vv", "tag --contains", "reflog", "stash list", "rev-list", "--not --remotes",

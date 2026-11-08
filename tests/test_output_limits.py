@@ -16,6 +16,7 @@ class ModelReasonBoundTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.con = store.connect(Path(self.tmp.name) / "t.db")
+        self.addCleanup(self.con.close)
         self.rt = RetryRuntime()
 
     def dispatch(self):
@@ -82,8 +83,11 @@ class ListOpenWireTest(unittest.TestCase):
         self.rt = FakeRuntime()
 
     def dispatch(self, count, title):
-        return [core.dispatch(self.con, self.rt, orch_thread="thread-A", repo="demo", title=title(i), instructions="i",
-                              done_when="d", model_reason="r", task_type="code")["id"] for i in range(count)]
+        """Return the new task ids in list_open's documented (created_at, id) order. A coarse clock (Windows) can
+        give tasks equal created_at, so dispatch order alone does not fix the order."""
+        ids = {core.dispatch(self.con, self.rt, orch_thread="thread-A", repo="demo", title=title(i), instructions="i",
+                             done_when="d", model_reason="r", task_type="code")["id"] for i in range(count)}
+        return [r["id"] for r in self.con.execute("SELECT id FROM tasks ORDER BY created_at, id") if r["id"] in ids]
 
     def walk(self, args=None):
         """Follow next_cursor to the end; returns (pages, task ids read) with every reply's wire size checked."""
@@ -239,6 +243,7 @@ class IntakePendingBytesTest(IntakeBase):
     def test_final_wire_stays_within_budget_for_every_character_class(self):
         for name, ch in SAMPLES.items():
             with self.subTest(name):
+                self.con.close()  # IntakeBase's cleanup closes only the last self.con; Windows cannot delete open dbs
                 self.setUp()
                 ids = self.own(100, lambda i: dict(summary=(ch * 900)[:900], source_ref=(ch * 100)[:100]))
                 self.assertEqual(self.walk(), ids)  # no gap, no repeat

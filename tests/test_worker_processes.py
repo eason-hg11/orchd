@@ -12,23 +12,26 @@ from unittest import mock
 
 from orchd import core, store
 from orchd.runtime import Runtime
+from tests.portability import posix_only
 
 
 class WorkerProcessesTest(unittest.TestCase):
     def test_failed_cleanup_keeps_task_open_and_worktree_untouched(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            con = store.connect(Path(tmp) / 'tasks.db')
-            self.addCleanup(con.close)
-            store.create_task(con, id='t1', repo='demo', repo_path=tmp, title='T', instructions='i', done_when='d',
-                              orch_thread='th', codex_bin='c', model='gpt-6.1-sol', worktree=tmp, status='running')
-            rt = Runtime()
-            with mock.patch('orchd.runtime.cleanup_processes', side_effect=RuntimeError('task processes still alive')), \
-                 mock.patch.object(rt, 'remove_worktree') as remove:
-                with self.assertRaisesRegex(RuntimeError, 'task processes still alive'):
-                    core.close(con, rt, 't1')
-            remove.assert_not_called()
-            self.assertEqual(store.get_task(con, 't1')['status'], 'running')
-            self.assertEqual(con.execute("SELECT count(*) FROM messages WHERE kind='close'").fetchone()[0], 0)
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        tmp = holder.name
+        con = store.connect(Path(tmp) / 'tasks.db')
+        self.addCleanup(con.close)  # runs before holder.cleanup: Windows cannot delete an open database
+        store.create_task(con, id='t1', repo='demo', repo_path=tmp, title='T', instructions='i', done_when='d',
+                          orch_thread='th', codex_bin='c', model='gpt-6.1-sol', worktree=tmp, status='running')
+        rt = Runtime()
+        with mock.patch('orchd.runtime.cleanup_processes', side_effect=RuntimeError('task processes still alive')), \
+             mock.patch.object(rt, 'remove_worktree') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'task processes still alive'):
+                core.close(con, rt, 't1')
+        remove.assert_not_called()
+        self.assertEqual(store.get_task(con, 't1')['status'], 'running')
+        self.assertEqual(con.execute("SELECT count(*) FROM messages WHERE kind='close'").fetchone()[0], 0)
 
     def test_close_escalates_detached_children_and_preserves_unrelated_processes(self):
         self.exercise(ignore_term=True)
@@ -39,6 +42,8 @@ class WorkerProcessesTest(unittest.TestCase):
     def test_close_cleans_orphans_after_worker_already_exited(self):
         self.exercise(ignore_term=True, exited=True)
 
+    @posix_only("sessions, process groups and SIGTERM handling; Windows cleanup uses Job Objects "
+                "(tests/test_windows_job.py, tests/test_windows_cleanup.py)")
     def exercise(self, ignore_term, exited=False):
         for kind, model in (("claude", "claude-sonnet-5-5"), ("codex", "gpt-6.1-sol")):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
@@ -116,6 +121,7 @@ class WorkerProcessesTest(unittest.TestCase):
 
 
 class AppProcessIdentityTest(unittest.TestCase):
+    @posix_only("kills a process group with SIGKILL and expects exit status -9")
     def test_reused_birth_is_not_signalled_and_bounded_kill_targets_only_group(self):
         import json
         import subprocess

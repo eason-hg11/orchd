@@ -12,21 +12,20 @@ from unittest.mock import patch
 from pathlib import Path
 
 from orchd import core, mcp_server, runtime, store
+from tests.portability import needs_af_unix
 from tests.test_orchd import FakeRuntime
 
 
 class AnswerQueueTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)  # cleanups run last-in first-out: every connection closes before this
         self.db = Path(self.tmp.name) / "t.db"
         self.con = store.connect(self.db)
+        self.addCleanup(lambda: self.con.close())  # tests may reopen self.con
         self.rt = FakeRuntime()
         self.ticks = []  # simulated clock: no test really waits
         self.rt.sleep = self.ticks.append
-
-    def tearDown(self):
-        self.con.close()
-        self.tmp.cleanup()
 
     def dispatch(self, model="sol"):
         return core.dispatch(self.con, self.rt, orch_thread="thread-A", repo="demo", title="T", instructions="do it",
@@ -322,6 +321,7 @@ class AnswerQueueTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "worker has ended"):
             core.answer(self.con, self.rt, t["id"], "x")
 
+    @needs_af_unix
     def test_bound_but_not_listening_socket_then_listen_flushes_to_same_worker(self):
         t = self.dispatch(model="sonnet")
         folder = tempfile.mkdtemp(dir="/tmp")
@@ -468,18 +468,23 @@ class AnswerQueueTest(unittest.TestCase):
                 "SELECT body FROM messages WHERE task_id=? AND kind='followup'", (t["id"],)).fetchone()[0])
             self.assertEqual(event["status"], "uncertain" if phase == "write" else "delivered")
 
+    @needs_af_unix
     def test_real_socket_shutdown_after_frame_answer_once(self):
         self.socket_delivery("answer", "shutdown")
 
+    @needs_af_unix
     def test_real_socket_shutdown_after_frame_followup_once(self):
         self.socket_delivery("followup", "shutdown")
 
+    @needs_af_unix
     def test_real_socket_partial_write_answer_uncertain(self):
         self.socket_delivery("answer", "write")
 
+    @needs_af_unix
     def test_real_socket_partial_write_followup_uncertain(self):
         self.socket_delivery("followup", "write")
 
+    @needs_af_unix
     def test_real_socket_partial_write_interrupt_uncertain(self):
         self.socket_delivery("interrupt", "write")
 

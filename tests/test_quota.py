@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import json
 import os
+import sys
 from unittest.mock import patch
 import io
 import contextlib
@@ -18,7 +19,7 @@ REAL_CACHE = quota.Cache
 class QuotaTest(unittest.TestCase):
     def test_weekly_only_replaces_old_session_with_explicit_unknown(self):
         now = datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc).timestamp()
-        display = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text()
+        display = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text(encoding='utf-8')
         with tempfile.TemporaryDirectory() as tmp:
             cache = quota.Cache(Path(tmp) / 'quota.db')
             self._sonnet_known(cache, now - 10)
@@ -34,7 +35,7 @@ class QuotaTest(unittest.TestCase):
 
     def test_weekly_only_auto_uses_known_window_and_reports_missing_session(self):
         now = datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc).timestamp()
-        display = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text()
+        display = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text(encoding='utf-8')
         with tempfile.TemporaryDirectory() as tmp:
             cache = quota.Cache(Path(tmp) / 'quota.db')
             for sol, week, limited, expected in [(60, 17, (), 'sonnet'), (10, 17, (), 'terra'),
@@ -52,7 +53,7 @@ class QuotaTest(unittest.TestCase):
 
     def test_independent_usage_windows_reject_invalid_fields_without_fabrication(self):
         now = datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc).timestamp()
-        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text()
+        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text(encoding='utf-8')
         valid = 'Current session: 5% used · resets Nov 1 at 9pm (Asia/Taipei)'
         bad = ['Current session: 5% used · resets tomorrow', valid.replace('5%', '101%'),
                valid.replace('Nov 1', 'Nov 9'), valid.replace('9pm', '13pm'),
@@ -77,7 +78,7 @@ class QuotaTest(unittest.TestCase):
     def test_partial_probe_failure_and_complete_recovery_preserve_diagnostics(self):
         import subprocess
         now = datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc).timestamp()
-        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text()
+        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text(encoding='utf-8')
         with tempfile.TemporaryDirectory() as tmp:
             cache = quota.Cache(Path(tmp) / 'quota.db')
             displays = [week, 'PRIVATE unsupported', week +
@@ -101,7 +102,7 @@ class QuotaTest(unittest.TestCase):
     def test_weekly_only_auto_aliases_expiry_and_unknown_fallback(self):
         from orchd import models
         now = datetime.datetime(2026, 11, 1, 12, tzinfo=datetime.timezone.utc).timestamp()
-        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text()
+        week = (Path(__file__).parent / 'fixtures/claude_usage_weekly_only.txt').read_text(encoding='utf-8')
         catalog = {'custom_codex': dict(models.DEFAULTS['terra']),
                    'custom_claude': dict(models.DEFAULTS['sonnet'])}
         with tempfile.TemporaryDirectory() as tmp, patch.object(models, 'catalog', return_value=catalog):
@@ -352,9 +353,8 @@ class QuotaTest(unittest.TestCase):
     def test_shadow_dispatch_preserves_explicit_model_and_records_review_rule(self):
         from orchd import core, store
         from tests.test_orchd import FakeRuntime
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'ORCHD_HOME': tmp}):
-            con = store.connect()
-            self.addCleanup(con.close)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'ORCHD_HOME': tmp}), \
+                contextlib.closing(store.connect()) as con:
             args = dict(orch_thread='orch', repo='demo', title='T', instructions='do', done_when='ok',
                         model='sol', backend='exec', model_reason='explicit', task_type='code')
             author = core.dispatch(con, FakeRuntime(), **args)
@@ -589,7 +589,7 @@ class QuotaTest(unittest.TestCase):
             cache = quota.Cache(Path(tmp) / 'quota.db')
             self.assertIsNone(cache.status()['sonnet']['refresh']['last_attempt_at'])
             self.assertFalse(cache.path.exists())
-            with sqlite3.connect(cache.path) as con:
+            with contextlib.closing(sqlite3.connect(cache.path)) as con, con:
                 con.execute('CREATE TABLE buckets (provider TEXT, id TEXT, observed REAL, source TEXT, windows TEXT)')
             before = cache.path.read_bytes()
             self.assertEqual(cache.status()['sonnet']['refresh']['history'], [])
@@ -716,6 +716,13 @@ class QuotaTest(unittest.TestCase):
     def _fake_claude(self, tmp):
         """Executable that records its pid then sleeps, standing in for a hung `claude /usage`."""
         pidfile = Path(tmp) / 'pid'
+        if os.name == 'nt':  # Popen runs a .cmd through cmd.exe; the recorded pid is its python child
+            body = Path(tmp) / 'claude.py'
+            body.write_text(f'import os, time\nopen({str(pidfile)!r}, "w").write(str(os.getpid()))\n'
+                            'time.sleep(60)\n', encoding='utf-8')
+            script = Path(tmp) / 'claude.cmd'
+            script.write_text(f'@"{sys.executable}" "{body}" %*\r\n', encoding='utf-8')
+            return script, pidfile
         script = Path(tmp) / 'claude'
         script.write_text(f'#!/bin/sh\necho $$ > {pidfile}\nsleep 60\n')
         script.chmod(0o755)
@@ -723,6 +730,9 @@ class QuotaTest(unittest.TestCase):
 
     @staticmethod
     def _alive(pid):
+        if os.name == 'nt':  # os.kill(pid, 0) would send CTRL_C_EVENT on Windows
+            import psutil
+            return psutil.pid_exists(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

@@ -6,7 +6,6 @@ import base64
 import hashlib
 import json
 import os
-import socket
 import struct
 import sys
 import time
@@ -67,12 +66,13 @@ def handshake(conn):
 def main():
     path = sys.argv[sys.argv.index('--listen') + 1].removeprefix('unix://')
     log(event='start', cwd=os.path.realpath(os.getcwd()))
-    server = socket.socket(socket.AF_UNIX)
-    server.bind(path)
+    from orchd import unix_socket  # Windows CPython lacks socket.AF_UNIX; orchd binds through Winsock there
+    server = unix_socket.create()
+    unix_socket.bind(server, path)
     server.listen(4)
     turns = 0
     while True:
-        conn, _ = server.accept()
+        conn, _ = unix_socket.accept(server)
         try:
             handshake(conn)
             while True:

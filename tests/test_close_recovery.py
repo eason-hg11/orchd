@@ -59,6 +59,7 @@ class HookRuntime(Runtime):
 class CloseSubmoduleTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)  # cleanups run last-in first-out: connections close before this
         root = Path(self.tmp.name)
         sub_remote, self.remote = root / "sub.git", root / "remote.git"
         for bare in (sub_remote, self.remote):
@@ -80,19 +81,17 @@ class CloseSubmoduleTest(unittest.TestCase):
         git("push", "-q", "-u", "origin", "main", cwd=repo)
         git("remote", "set-head", "origin", "main", cwd=repo)
         os.environ["ORCHD_PROJECTS"] = str(self.projects)
+        self.addCleanup(os.environ.pop, "ORCHD_PROJECTS", None)
         self.rt = HookRuntime()
         self.repo = self.rt.repo_path("demo")
         self.base, self.branch, self.wt = self.rt.create_worktree(self.repo, "demo", "abcd1234")
         git("submodule", "update", "-q", "--init", cwd=self.wt)
         self.sub = os.path.join(self.wt, "vendor")
         self.con = store.connect(root / "t.db")
+        self.addCleanup(self.con.close)
         store.create_task(self.con, id="abcd1234", repo="demo", repo_path=str(self.repo), title="T",
                           instructions="i", done_when="d", orch_thread="th", codex_bin="c", model="claude-sonnet-5-5",
                           base=self.base, branch=self.branch, worktree=self.wt, status="done")
-
-    def tearDown(self):
-        os.environ.pop("ORCHD_PROJECTS", None)
-        self.tmp.cleanup()
 
     def close_events(self):
         return self.con.execute("SELECT body FROM messages WHERE kind='close'").fetchall()
@@ -463,6 +462,7 @@ class CloseRetryTest(unittest.TestCase):
         self.rt = FailingRemoveRuntime(RuntimeError("git worktree remove failed (exit 128): fatal: boom"))
 
     def tearDown(self):
+        self.con.close()
         self.tmp.cleanup()
 
     def events(self, kind):

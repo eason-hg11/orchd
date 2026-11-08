@@ -1,6 +1,7 @@
 """Exercise the executable boundary, including git's actual credential protocol."""
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -8,7 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orchd.runtime import Runtime, worker_env
+from orchd.runtime import Runtime, worker_bin_dir, worker_env
+from tests.portability import WINDOWS, needs_symlinks
 from orchd.core import worker_brief
 
 WRAPPER = Path(__file__).resolve().parents[1] / "orchd" / "worker_bin"
@@ -41,14 +43,25 @@ else:
                       'active': Path(os.environ['ACTIVE']).read_text()}))
 ''')
         gh.chmod(0o755)
+        if WINDOWS:  # Windows resolves commands by PATHEXT, not shebangs; orchd's own launcher is gh.cmd
+            (self.fake / 'gh.cmd').write_text(f'@echo off\r\n"{sys.executable}" "{gh}" %*\r\n', newline='')
+            with patch.dict(os.environ, ORCHD_HOME=str(self.root / 'state')):
+                self.wrapper = worker_bin_dir()
+        else:
+            self.wrapper = str(WRAPPER)
         self.active = self.root / "active"
         self.active.write_text('ExampleOrg')
         self.home = self.root / 'home'
         (self.home / '.config' / 'orchd').mkdir(parents=True)
         (self.home / '.config' / 'orchd' / 'gh-accounts.json').write_text('{"ExampleOwner": "ExampleOwner", "*": "ExampleOrg"}')
-        self.env = dict(os.environ, PATH=f'{WRAPPER}:{self.fake}:' + os.environ['PATH'], HOME=str(self.home),
+        self.env = dict(os.environ, PATH=os.pathsep.join([self.wrapper, str(self.fake), os.environ['PATH']]), HOME=str(self.home),
                         ORCHD_HOME=str(self.root / 'state'),
                         CALLS=str(self.root / 'calls'), INPUT=str(self.root / 'input'), ACTIVE=str(self.active))
+        if WINDOWS:  # Path.home() reads USERPROFILE there, not HOME
+            self.env['USERPROFILE'] = str(self.home)
+        # Should a real gh ever be reached, its config and state stay in the temp dir, not the user's or the cwd.
+        self.env.update(GH_CONFIG_DIR=str(self.root / 'gh-config'), XDG_CONFIG_HOME=str(self.home / '.config'),
+                        XDG_STATE_HOME=str(self.home / '.local' / 'state'))
         for key in ('GH_TOKEN', 'GH_REPO', 'ORCHD_GH_ACCOUNTS'):
             self.env.pop(key, None)
         for key in list(self.env):
@@ -60,7 +73,10 @@ else:
                        cwd=self.repo, check=True)
 
     def run_gh(self, *args, input=None, env=None, cwd=None):
-        return subprocess.run(['gh', *args], env=env or self.env, cwd=cwd or self.repo,
+        env = env or self.env
+        # Windows CreateProcess finds only gh.exe on PATH, which would be the real gh; resolve by PATHEXT like a shell.
+        gh = shutil.which('gh', path=env['PATH']) if WINDOWS else 'gh'
+        return subprocess.run([gh, *args], env=env, cwd=cwd or self.repo,
                               input=input, capture_output=True, text=True, timeout=10, check=True)
 
     def test_repo_sources_and_precedence(self):
@@ -107,17 +123,22 @@ else:
         self.assertIn('password=original', result.stdout)
         self.assertEqual(result.stderr, '')
 
+    @needs_symlinks
     def test_no_recursion_with_duplicate_and_symlink_path_entries(self):
         alias = self.root / 'alias'
         alias.mkdir()
-        (alias / 'gh').symlink_to(WRAPPER / 'gh')
-        env = dict(self.env, PATH=f'{WRAPPER}:{alias}:' + self.env['PATH'])
+        (alias / 'gh').symlink_to(Path(self.wrapper) / 'gh')
+        if WINDOWS:
+            (alias / 'gh.cmd').symlink_to(Path(self.wrapper) / 'gh.cmd')
+        env = dict(self.env, PATH=os.pathsep.join([self.wrapper, str(alias), self.env['PATH']]))
         self.assertEqual(json.loads(self.run_gh('repo', 'view', env=env).stdout)['token'], 'token-ExampleOwner')
         self.assertEqual(len((self.root / 'calls').read_text().splitlines()), 2)
         python_bin = self.root / 'python-bin'
         python_bin.mkdir()
         (python_bin / 'python3').symlink_to(sys.executable)
-        result = subprocess.run([str(WRAPPER / 'gh')], env=dict(self.env, PATH=f'{WRAPPER}:{alias}:{python_bin}'),
+        # Windows cannot exec the shebang script, so run it with this interpreter.
+        command = [sys.executable, str(WRAPPER / 'gh')] if WINDOWS else [str(WRAPPER / 'gh')]
+        result = subprocess.run(command, env=dict(self.env, PATH=os.pathsep.join([self.wrapper, str(alias), str(python_bin)])),
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 127)
         self.assertIn('no real gh', result.stderr)

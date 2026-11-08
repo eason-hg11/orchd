@@ -36,9 +36,29 @@ jobs:
       - name: Compile
         run: python -m compileall -q orchd scripts tests
 
+  windows-tests:
+    # The full suite on native Windows. Tests of POSIX-only behaviour (signals, process groups, file modes,
+    # AF_UNIX peers, FIFOs) skip with a reason from tests/portability.py; native-portability.yml keeps the
+    # Windows-specific smoke tests.
+    name: Unit tests (Windows, Python 3.13)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install runtime dependencies
+        run: python -m pip install .
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+
   package:
-    # Native Windows runs the build and wheel install here; its unit-test subset lives in
-    # native-portability.yml because the full suite assumes POSIX process and socket behavior.
+    # Native Windows runs the build and wheel install here; the full Windows unit suite is windows-tests.
     name: Build and isolated wheel install (${{ matrix.os }})
     strategy:
       fail-fast: false

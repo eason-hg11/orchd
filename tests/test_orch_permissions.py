@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,13 @@ from pathlib import Path
 from unittest import mock
 
 from orchd.runtime import Runtime, ORCH_TOOLS
+from tests.portability import WINDOWS, posix_only
+
+
+def remove_private_mcp_dir(test, config):
+    """On Windows start_orch writes mcp.json into its own mkdtemp dir (POSIX: beside the socket)."""
+    if WINDOWS and config.parent.name.startswith("orchd-o-"):
+        test.addCleanup(shutil.rmtree, config.parent, True)
 
 
 class OrchPermissionsTest(unittest.TestCase):
@@ -16,20 +24,25 @@ class OrchPermissionsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp).resolve() / "orch home"
             home.mkdir()
+            # A real python3-shebang entry point: on Windows paths.mcp_launch classifies it by reading the shebang.
+            orchd = Path(tmp) / "orchd"
+            orchd.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             rt = Runtime()
             with mock.patch.object(rt, "orch_socket_path", return_value=str(Path(tmp) / "o.sock")), \
                     mock.patch.object(rt, "start_claude", return_value=("job", "session")) as start, \
-                    mock.patch("orchd.paths.orchd_executable", return_value="/x/bin/orchd"):
+                    mock.patch("orchd.paths.orchd_executable", return_value=str(orchd)):
                 rt.start_orch("o38", "opus", home)
             args = start.call_args.args[3]
-            server = json.loads(Path(args[args.index("--mcp-config") + 1]).read_text())["mcpServers"]["orchd"]
-            self.assertEqual((server["command"], server["args"]), (sys.executable, ["/x/bin/orchd", "mcp"]))
+            config = Path(args[args.index("--mcp-config") + 1])
+            remove_private_mcp_dir(self, config)
+            server = json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["orchd"]
+            self.assertEqual((server["command"], server["args"]), (sys.executable, [str(orchd), "mcp"]))
 
     def test_only_groups_are_writable_and_only_this_homes_temp_tree_is_added(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp).resolve() / "orch home"
             home.mkdir()
-            (home / "AGENTS.md").write_text("Keep group notes.")
+            (home / "AGENTS.md").write_text("Keep group notes.", encoding="utf-8")
             rt = Runtime()
             sock = str(Path(tmp) / "o.sock")
             with mock.patch.object(rt, "orch_socket_path", return_value=sock), \
@@ -56,26 +69,35 @@ class OrchPermissionsTest(unittest.TestCase):
             self.assertEqual(settings["crossSessionInbound"], "accept")
             self.assertEqual(settings["permissions"]["disableBypassPermissionsMode"], "disable")
             self.assertEqual(settings["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "1")
-            mcp = json.loads(Path(args[args.index("--mcp-config") + 1]).read_text())
+            config = Path(args[args.index("--mcp-config") + 1])
+            remove_private_mcp_dir(self, config)
+            mcp = json.loads(config.read_text(encoding="utf-8"))
             self.assertEqual(set(mcp["mcpServers"]), {"orchd"})
-            self.assertEqual(settings["permissions"]["allow"],
-                             [f"Read(/{home}/**)", f"Read(/{settings['permissions']['additionalDirectories'][0]}/**)",
-                              f"Edit(/{home}/groups/**)", "mcp__orchd"])
             self.assertTrue(settings["permissions"]["blockReadsOutsideWorkingDirectories"])
             self.assertIn(f"Edit(/{home}/CLAUDE.md)", settings["permissions"]["deny"])
             for pattern in (".*", ".*/**", "AGENTS.md", "CLAUDE.md", "settings.json",
                             "settings.local.json", "mcp.json"):
                 self.assertIn(f"Edit(/{home}/groups/**/{pattern})", settings["permissions"]["deny"])
-            images, = settings["permissions"]["additionalDirectories"]
-            key = re.sub(r"[^a-zA-Z0-9]", "-", str(home))
-            self.assertEqual(images, str((Path("/tmp") / f"claude-{os.getuid()}" / key).resolve()))
-            mkdir.assert_called_once_with(mode=0o700, parents=True, exist_ok=True)
-            chmod.assert_called_once_with(0o700)
             self.assertNotIn("Edit", settings["permissions"]["allow"])
             self.assertNotIn("Write", settings["permissions"]["allow"])
-            self.assertIn(images, args[args.index("--append-system-prompt") + 1])
+            if WINDOWS:  # runtime.start_orch adds no Claude image temp tree on Windows: only the Orch home is readable
+                self.assertEqual(settings["permissions"]["additionalDirectories"], [])
+                self.assertEqual(settings["permissions"]["allow"], [f"Read(/{home}/**)", f"Edit(/{home}/groups/**)", "mcp__orchd"])
+                mkdir.assert_not_called()
+                chmod.assert_not_called()
+            else:
+                self.assertEqual(settings["permissions"]["allow"],
+                                 [f"Read(/{home}/**)", f"Read(/{settings['permissions']['additionalDirectories'][0]}/**)",
+                                  f"Edit(/{home}/groups/**)", "mcp__orchd"])
+                images, = settings["permissions"]["additionalDirectories"]
+                key = re.sub(r"[^a-zA-Z0-9]", "-", str(home))
+                self.assertEqual(images, str((Path("/tmp") / f"claude-{os.getuid()}" / key).resolve()))
+                mkdir.assert_called_once_with(mode=0o700, parents=True, exist_ok=True)
+                chmod.assert_called_once_with(0o700)
+                self.assertIn(images, args[args.index("--append-system-prompt") + 1])
             self.assertIn("Keep group notes.", args[args.index("--append-system-prompt") + 1])
 
+    @posix_only("the Claude image temp tree and its 200-character key limit exist only on POSIX (paths.orch_images)")
     def test_long_home_fails_closed_before_starting_a_session(self):
         rt = Runtime()
         with mock.patch.object(rt, "start_claude") as start:

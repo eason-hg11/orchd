@@ -8,6 +8,7 @@ from unittest import mock
 from orchd import core, orch_revive, store
 from orchd.runtime import Runtime
 from tests.test_orchd import FakeRuntime
+from tests.portability import posix_only
 
 
 class GoneOnce(FakeRuntime):
@@ -84,6 +85,8 @@ class ReviveTest(unittest.TestCase):
         self.assertEqual(store.get_orch(self.con, self.orch)["job_id"], "orchjob")
 
 
+@posix_only("a Claude Orch socket is an AF_UNIX file under /tmp that can outlive its Orch; "
+            "on Windows orch_socket_path is a fresh named pipe per start")
 class RuntimeResumeTest(unittest.TestCase):
     def start(self, rt, sock, home, **kw):
         with mock.patch.object(rt, "orch_socket_path", return_value=sock), \

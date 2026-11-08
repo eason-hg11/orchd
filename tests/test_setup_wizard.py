@@ -7,7 +7,9 @@ import os
 import shutil
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from tests.portability import needs_symlinks, posix_only
 
 SPEC = importlib.util.spec_from_file_location("setup_wizard", Path(__file__).resolve().parents[1] / "scripts" / "setup-wizard.py")
 sw = importlib.util.module_from_spec(SPEC)
@@ -16,6 +18,11 @@ SPEC.loader.exec_module(sw)
 needs_toml = unittest.skipIf(sw.tomllib is None, "no tomllib on this Python; wizard reports TOML checks unknown")
 
 SECRET = "FAKE_REDACTION_SENTINEL"
+
+
+def toml(path):
+    """A TOML basic string for `path`; JSON string escaping is valid TOML, so Windows backslashes survive."""
+    return json.dumps(str(path))
 
 
 def snapshot(root):
@@ -70,7 +77,8 @@ def write_key(env, name, body="PRIVATE", pub=True):
     ssh.mkdir(exist_ok=True)
     (ssh / name).write_text(body)
     if pub:
-        (ssh / (name + ".pub")).write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake test\n")
+        (ssh / (name + ".pub")).write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake test\n",
+                                           newline="\n")  # as ssh-keygen writes it, also on Windows
 
 
 def by_id(steps):
@@ -113,7 +121,7 @@ class WizardTest(unittest.TestCase):
         (env.home / ".claude.json").write_text(json.dumps({"projects": {
             str(orch): {"hasTrustDialogAccepted": True}, str(env.projects / "a"): {"hasTrustDialogAccepted": True}}}))
         (env.home / ".codex").mkdir()
-        (env.home / ".codex" / "config.toml").write_text(f'[projects."{orch}"]\ntrust_level = "trusted"\n')
+        (env.home / ".codex" / "config.toml").write_text(f'[projects.{toml(orch)}]\ntrust_level = "trusted"\n')
         steps = by_id(sw.build_plan(env, "generic"))
         self.assertEqual(steps["trust-orch-claude"].status, sw.PASS)
         self.assertEqual(steps["trust-orch-codex"].status, sw.PASS)
@@ -152,7 +160,7 @@ class WizardTest(unittest.TestCase):
         (env.orch_home / ".codex").mkdir(parents=True)
         (env.orch_home / "AGENTS.md").write_text("x")
         (env.orch_home / ".codex" / "config.toml").write_text(
-            f'"/home/example/projects/orch" = "write"\n"{env.home}/x" = "read"\n')
+            f'"/home/example/projects/orch" = "write"\n{toml(f"{env.home}/x")} = "read"\n')
         step = by_id(sw.build_plan(env, "generic"))["orch-config-paths"]
         self.assertEqual(step.status, sw.MISSING)
         self.assertIn("/home/example", step.detail)
@@ -389,10 +397,10 @@ class WizardTest(unittest.TestCase):
         (env.orch_home / ".codex").mkdir(parents=True)
         (env.orch_home / "AGENTS.md").write_text("x")
         cfg = env.orch_home / ".codex" / "config.toml"
-        cfg.write_text(f'"{env.home}/projects/orch" = "write"\n"{env.home}" = "read"\n')
+        cfg.write_text(f'{toml(f"{env.home}/projects/orch")} = "write"\n{toml(env.home)} = "read"\n')
         step = by_id(sw.build_plan(env, "generic"))["orch-config-paths"]
         self.assertEqual(step.status, sw.PASS, step.detail)
-        cfg.write_text(f'"{env.home}/x" = "write"\n"/home/example/orch" = "read"\n')
+        cfg.write_text(f'{toml(f"{env.home}/x")} = "write"\n"/home/example/orch" = "read"\n')
         step = by_id(sw.build_plan(env, "generic"))["orch-config-paths"]
         self.assertEqual(step.status, sw.MISSING)
         self.assertIn("/home/example", step.detail)
@@ -401,7 +409,7 @@ class WizardTest(unittest.TestCase):
     @needs_toml
     def test_home_like_users_nat_space_directly(self):
         env = make_env(self.tmp.name, Fake())
-        env.home = Path("/home/example Space")
+        env.home = PurePosixPath("/home/example Space")  # foreign_homes judges POSIX homes
         cfg = Path(self.tmp.name) / "c.toml"
         cfg.write_text('"/home/example Space/projects" = "write"\n')
         self.assertEqual(sw.foreign_homes(env, cfg), [])
@@ -551,6 +559,7 @@ class TargetEnvironmentTest(unittest.TestCase):
         auth = [a for a in fake.calls if a[1:2] in (["auth"], ["login"])]
         self.assertEqual(auth, [])  # not even asked: the answer would describe the wrong user
 
+    @posix_only("shebang stubs run by bare name from the child PATH (Windows CreateProcess finds only .exe on the parent PATH)")
     def test_home_override_real_runner_never_writes_into_target_home(self):
         """gh and codex create dirs under $HOME on startup. A stub that does the same must not touch --home."""
         bin_dir = Path(self.tmp.name) / "bin"
@@ -599,7 +608,7 @@ class TargetEnvironmentTest(unittest.TestCase):
         (orch / "AGENTS.md").write_text("x")
         (env.home / ".claude.json").write_text(json.dumps({"projects": {str(orch): {"hasTrustDialogAccepted": True}}}))
         (env.home / ".codex").mkdir()
-        (env.home / ".codex" / "config.toml").write_text(f'[projects."{orch}"]\ntrust_level = "trusted"\n[mcp_servers.orchd]\ncommand = "x"\n')
+        (env.home / ".codex" / "config.toml").write_text(f'[projects.{toml(orch)}]\ntrust_level = "trusted"\n[mcp_servers.orchd]\ncommand = "x"\n')
         env.environ.update({"CLAUDE_CONFIG_DIR": "/elsewhere", "CODEX_HOME": "/elsewhere2"})
         steps = by_id(sw.build_plan(env, "generic"))
         for sid in ("trust-orch-claude", "trust-orch-codex", "mcp-orchd-codex"):
@@ -625,11 +634,13 @@ class PublicKeyOnlyTest(unittest.TestCase):
     def test_real_pair_passes(self):
         self.assertTrue(sw.pub_key_ok(self.env, self.key))
 
+    @needs_symlinks
     def test_pub_symlink_to_private_is_refused(self):
         self.pub.unlink()
         self.pub.symlink_to(self.key)
         self.assertFalse(sw.pub_key_ok(self.env, self.key))
 
+    @needs_symlinks
     def test_pub_symlink_to_a_real_public_key_is_refused_too(self):
         elsewhere = keypair(Path(self.tmp.name) / "other")
         self.pub.unlink()
@@ -645,11 +656,14 @@ class PublicKeyOnlyTest(unittest.TestCase):
         os.link(self.key, self.pub)
         self.assertFalse(sw.pub_key_ok(self.env, self.key))
 
-    def test_garbage_and_non_regular_pub_are_refused(self):
+    def test_garbage_pub_is_refused(self):
         self.pub.write_text("ssh-ed25519 not-base64!!\n")
         self.assertFalse(sw.pub_key_ok(self.env, self.key))
         self.pub.write_text("ssh-ed25519 AAAA test")  # well-formed shape but not a key: ssh-keygen says no
         self.assertFalse(sw.pub_key_ok(self.env, self.key))
+
+    @posix_only("FIFOs (os.mkfifo)")
+    def test_fifo_pub_is_refused(self):
         self.pub.unlink()
         os.mkfifo(self.pub)
         self.assertFalse(sw.pub_key_ok(self.env, self.key))  # must not block on a FIFO
@@ -692,7 +706,7 @@ class HomeBoundaryTest(unittest.TestCase):
 
     def scan(self, home, text):
         env = make_env(self.tmp.name, Fake(), home_name=f"x{len(list(Path(self.tmp.name).iterdir()))}")
-        env.home = Path(home)
+        env.home = PurePosixPath(home)  # foreign_homes judges POSIX (/Users, /home) homes
         self.cfg.write_text(text)
         return sw.foreign_homes(env, self.cfg)
 
@@ -756,11 +770,11 @@ class OrchdPathOverrideTest(unittest.TestCase):
         for d in (self.caller / "orch" / ".codex", self.caller / "state", self.target / "projects"):
             d.mkdir(parents=True)
         (self.caller / "orch" / "AGENTS.md").write_text("x")
-        (self.caller / "orch" / ".codex" / "config.toml").write_text(f'[mcp_servers.orchd]\ncommand = "{self.caller}/x"\n')
+        (self.caller / "orch" / ".codex" / "config.toml").write_text(f'[mcp_servers.orchd]\ncommand = {toml(f"{self.caller}/x")}\n')
         trust = {str(self.caller / "orch"): {"hasTrustDialogAccepted": True}}
         (self.target / ".claude.json").write_text(json.dumps({"projects": trust}))
         (self.target / ".codex").mkdir()
-        (self.target / ".codex" / "config.toml").write_text(f'[projects."{self.caller / "orch"}"]\ntrust_level = "trusted"\n')
+        (self.target / ".codex" / "config.toml").write_text(f'[projects.{toml(self.caller / "orch")}]\ntrust_level = "trusted"\n')
         self.ro = self.target / ".local"
         self.ro.mkdir()
         self.ro.chmod(0o500)  # target state parent not writable: a real probe of the target says missing
@@ -780,6 +794,7 @@ class OrchdPathOverrideTest(unittest.TestCase):
             for text in (st.detail, st.source, st.receipt, *st.commands):
                 self.assertNotIn(str(self.caller), text, sid)
 
+    @posix_only("chmod 0o500 makes the target state dir unwritable (os.access ignores it for Windows dirs)")
     def test_foreign_home_orch_home_override_alone(self):
         steps = self.foreign(ORCHD_ORCH_HOME=self.caller / "orch")
         self.assert_unknown_names_only(steps, self.ORCH_STEPS, "ORCHD_ORCH_HOME")
@@ -798,6 +813,7 @@ class OrchdPathOverrideTest(unittest.TestCase):
         self.assert_unknown_names_only(steps, ("orchd-home",), "ORCHD_HOME")
         self.assertNotIn(str(self.caller), sw.render(list(steps.values()), sw.Env(home=self.target, projects=self.target)))
 
+    @posix_only("chmod 0o500 makes the target state dir unwritable (os.access ignores it for Windows dirs)")
     def test_foreign_home_without_overrides_checks_target_defaults(self):
         steps = self.foreign()
         self.assertEqual(steps["orch-home"].status, sw.MISSING)
@@ -809,6 +825,7 @@ class OrchdPathOverrideTest(unittest.TestCase):
         return by_id(sw.build_plan(env, "generic"))
 
     @needs_toml
+    @posix_only("chmod 0o500 makes the target state dir unwritable (os.access ignores it for Windows dirs)")
     def test_same_home_orch_home_override_is_honoured(self):
         steps = self.same(ORCHD_ORCH_HOME=self.caller / "orch")
         self.assertEqual(steps["orch-home"].status, sw.PASS)
@@ -846,9 +863,9 @@ class NoTomllibTest(unittest.TestCase):
         env = make_env(self.tmp.name, Fake(tools={"git", "python3"}))
         (env.orch_home / ".codex").mkdir(parents=True)
         (env.orch_home / "AGENTS.md").write_text("x")
-        (env.orch_home / ".codex" / "config.toml").write_text(f'"/home/example/x" = "write"\n[projects."{env.orch_home}"]\ntrust_level = "trusted"\n')
+        (env.orch_home / ".codex" / "config.toml").write_text(f'"/home/example/x" = "write"\n[projects.{toml(env.orch_home)}]\ntrust_level = "trusted"\n')
         (env.home / ".codex").mkdir()
-        (env.home / ".codex" / "config.toml").write_text(f'[projects."{env.orch_home}"]\ntrust_level = "trusted"\n[mcp_servers.orchd]\ncommand = "x"\n')
+        (env.home / ".codex" / "config.toml").write_text(f'[projects.{toml(env.orch_home)}]\ntrust_level = "trusted"\n[mcp_servers.orchd]\ncommand = "x"\n')
         steps = by_id(sw.build_plan(env, "generic"))
         for sid in ("trust-orch-codex", "orch-config-paths", "mcp-orchd-codex"):
             self.assertEqual(steps[sid].status, sw.UNKNOWN, sid)

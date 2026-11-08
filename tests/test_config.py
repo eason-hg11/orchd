@@ -9,14 +9,18 @@ from pathlib import Path
 from unittest import mock
 
 from orchd import cli, config, core, store
+from tests.portability import posix_only
 from tests.test_orchd import FakeRuntime
+
+# projects_dir must be absolute: "/a" is not on Windows, "C:/a" is (and needs no TOML escaping).
+ABS = "C:" if os.name == "nt" else ""
 
 
 class ConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name) / "cfg"
-        env = {k: v for k, v in os.environ.items() if k not in ("ORCHD_WORKER_MODEL", "ORCHD_CONFIG_FILE")}
+        env = {k: v for k, v in os.environ.items() if k not in ("ORCHD_WORKER_MODEL", "ORCHD_CONFIG_FILE", "ORCHD_PROJECTS")}
         env.update(ORCHD_CONFIG_DIR=str(self.dir), ORCHD_HOME=self.tmp.name)
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
@@ -199,6 +203,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(stale.read_text(), "other writer")
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["config.toml", "config.toml.tmp"])
 
+    @posix_only("0700/0600 file modes")
     def test_permissions(self):
         self.run_cli("config", "set", "worker-model", "sol")
         self.assertEqual(self.dir.stat().st_mode & 0o777, 0o700)
@@ -258,7 +263,7 @@ class ConfigTest(unittest.TestCase):
     def test_projects_dir_get_set_unset_and_show(self):
         root = Path(self.tmp.name) / "My Repos"
         self.assertEqual(self.run_cli("config", "set", "projects-dir", str(root))[0], 0)
-        self.assertEqual(self.file.read_text(), f'projects_dir = "{root}"\n')
+        self.assertEqual(self.file.read_text(), f'projects_dir = {json.dumps(str(root), ensure_ascii=False)}\n')
         self.assertEqual(self.run_cli("config", "get", "projects-dir"), (0, f"{root}\n", ""))
         self.assertEqual(json.loads(self.run_cli("config", "show")[1])["projects-dir"], {"value": str(root), "source": "file"})
         self.assertEqual(self.run_cli("config", "unset", "projects-dir")[0], 0)
@@ -275,15 +280,16 @@ class ConfigTest(unittest.TestCase):
     def test_projects_dir_crlf_file_keeps_every_other_byte(self):
         self.dir.mkdir(parents=True)
         self.file.write_bytes(b'# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
-        self.assertEqual(self.run_cli("config", "set", "projects-dir", "/a/b")[0], 0)
+        self.assertEqual(self.run_cli("config", "set", "projects-dir", f"{ABS}/a/b")[0], 0)
         self.assertEqual(self.file.read_bytes(),
-                         b'projects_dir = "/a/b"\r\n# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
-        self.assertEqual(self.run_cli("config", "set", "projects-dir", "/c")[0], 0)  # replace keeps the file's endings
+                         f'projects_dir = "{ABS}/a/b"\r\n'.encode() + b'# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
+        self.assertEqual(self.run_cli("config", "set", "projects-dir", f"{ABS}/c")[0], 0)  # replace keeps the file's endings
         self.assertEqual(self.file.read_bytes(),
-                         b'projects_dir = "/c"\r\n# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
+                         f'projects_dir = "{ABS}/c"\r\n'.encode() + b'# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
         self.assertEqual(self.run_cli("config", "unset", "projects-dir")[0], 0)
         self.assertEqual(self.file.read_bytes(), b'# mine\r\n[other]\r\nkeep = "me"\r\n[worker]\r\nmodel = "sol"\r\n')
 
+    @posix_only("0700/0600 file modes")
     def test_projects_dir_permissions(self):
         self.run_cli("config", "set", "projects-dir", "/a")
         self.assertEqual(self.dir.stat().st_mode & 0o777, 0o700)
@@ -296,13 +302,13 @@ class ConfigTest(unittest.TestCase):
         self.write('projects_dir = "/a"  # note\n[worker]\nmodel = "sol"\n')
         self.run_cli("config", "set", "worker-model", "sonnet")
         self.assertEqual(self.file.read_text(), 'projects_dir = "/a"  # note\n[worker]\nmodel = "sonnet"\n')
-        self.run_cli("config", "set", "projects-dir", "/b")
-        self.assertEqual(self.file.read_text(), 'projects_dir = "/b"\n[worker]\nmodel = "sonnet"\n')
+        self.run_cli("config", "set", "projects-dir", f"{ABS}/b")
+        self.assertEqual(self.file.read_text(), f'projects_dir = "{ABS}/b"\n[worker]\nmodel = "sonnet"\n')
 
     def test_projects_dir_fails_closed(self):
         for original in ('projects_dir = [\n', 'projects_dir.x = 1\n'):  # invalid TOML; dotted form we cannot edit in place
             self.write(original)
-            for action in (("set", "projects-dir", "/z"), ("unset", "projects-dir")):
+            for action in (("set", "projects-dir", f"{ABS}/z"), ("unset", "projects-dir")):
                 code, _, err = self.run_cli("config", *action)
                 self.assertEqual(code, 1, (original, action))
                 self.assertIn("config.toml", err)
@@ -312,8 +318,8 @@ class ConfigTest(unittest.TestCase):
         self.write('projects_dir = 7\n')
         with self.assertRaisesRegex(ValueError, "projects_dir"):
             config.file_projects_dir()
-        self.assertEqual(self.run_cli("config", "set", "projects-dir", "/ok")[0], 0)
-        self.assertEqual(self.file.read_text(), 'projects_dir = "/ok"\n')
+        self.assertEqual(self.run_cli("config", "set", "projects-dir", f"{ABS}/ok")[0], 0)
+        self.assertEqual(self.file.read_text(), f'projects_dir = "{ABS}/ok"\n')
 
     def test_mcp_dispatch_schema_does_not_hardcode_default(self):
         from orchd import mcp_server

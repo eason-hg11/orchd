@@ -10,11 +10,16 @@ from pathlib import Path
 from unittest import mock
 
 from orchd import core, store, verify
+from tests.portability import needs_symlinks, posix_only
 from tests.test_orchd import FakeRuntime
 
 CLI = Path(__file__).resolve().parents[1] / "bin" / "orchd"
 GIT_ENV = dict(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+# verify.run executes the locked command in a /bin/sh process group it can killpg, and verify.unsupported()
+# refuses any other host up front, so a run on Windows only ever reaches that refusal.
+posix_verify = posix_only("verify needs /bin/sh and POSIX process groups (os.killpg/os.setsid)")
 
 
 def git(cwd, *args):
@@ -94,6 +99,7 @@ class VerifyTest(unittest.TestCase):
             self.lock("tests/check.sh")  # a bare string is not a list of paths
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
 
+    @needs_symlinks
     def test_lock_refuses_symlinks_at_the_path_its_parents_or_beneath_a_dir(self):
         os.symlink("tests", self.wa / "link")
         os.symlink("/etc/hosts", self.wa / "tests" / "outside")
@@ -129,6 +135,7 @@ class VerifyTest(unittest.TestCase):
 
     # --- the independent rerun --------------------------------------------------------------------------
 
+    @posix_verify
     def test_independent_worker_passes_at_the_locked_sha_and_leaves_both_trees_as_they_were(self):
         lock = self.lock()
         a_head = git(self.wa, "rev-parse", "HEAD")
@@ -146,6 +153,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(verify.status(self.con, "V")["role"], "verifier")
         self.assertEqual(verify.status(self.con, "V")["state"], "pass")
 
+    @posix_verify
     def test_verify_refuses_before_any_checkout(self):
         cases = []
         self.task("N", self.wv)  # dispatched without verifies
@@ -178,6 +186,7 @@ class VerifyTest(unittest.TestCase):
         self.lock()
         self.assertEqual(verify.status(self.con, "A")["state"], "locked")
 
+    @posix_verify
     def test_failing_command_is_recorded_as_fail(self):
         self.lock(command="echo boom; exit 3")
         result = verify.run(self.con, "V")
@@ -186,6 +195,7 @@ class VerifyTest(unittest.TestCase):
         st = verify.status(self.con, "A")
         self.assertEqual((st["state"], st["exit"]), ("fail", 3))
 
+    @posix_verify
     def test_command_that_modifies_the_tree_fails_as_dirty_and_its_changes_are_kept(self):
         self.lock(command="echo weakened >> tests/check.sh; touch new-output.txt")
         result = verify.run(self.con, "V")
@@ -194,6 +204,7 @@ class VerifyTest(unittest.TestCase):
         self.assertTrue((self.wv / "new-output.txt").exists())
         self.assertEqual(verify.status(self.con, "A")["state"], "fail")
 
+    @posix_verify
     def test_hash_mismatch_against_the_lock_fails(self):
         # At the locked SHA the hashes can only differ if the lock row itself is wrong, so forge one.
         lock = self.lock()
@@ -203,6 +214,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual((result["exit"], result["hash_ok"], result["passed"]), (0, False, False))
         self.assertEqual(verify.status(self.con, "A")["state"], "fail")
 
+    @posix_verify
     def test_command_timeout_is_a_fail(self):
         self.lock(command="sleep 5")
         result = verify.run(self.con, "V", timeout=0.3)
@@ -232,6 +244,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(git(self.wv, "status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.branch(self.wv), "orchd/V")
 
+    @posix_verify
     def test_timeout_kills_background_children_before_the_restore(self):
         command, pidfile = self.late_writer("sleep 30")
         self.lock(command=command)
@@ -242,6 +255,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual((result["exit"], result["passed"], result["cleanup"], result["dirty"], result["restored"]),
                          (None, False, True, False, True))
 
+    @posix_verify
     def test_background_writer_of_a_passing_command_is_killed_before_the_tree_is_judged(self):
         command, pidfile = self.late_writer("exit 0")
         lock = self.lock(command=command)
@@ -252,6 +266,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(verify.status(self.con, "A")["state"], "pass")
         self.assertEqual(verify.status(self.con, "A")["lock_sha"], lock["sha"])
 
+    @posix_verify
     def test_background_writer_of_a_failing_command_is_killed_too(self):
         command, pidfile = self.late_writer("exit 5")
         self.lock(command=command)
@@ -259,6 +274,7 @@ class VerifyTest(unittest.TestCase):
         self.assert_writer_gone_and_nothing_landed(pidfile)
         self.assertEqual((result["exit"], result["passed"], result["cleanup"], result["dirty"]), (5, False, True, False))
 
+    @posix_verify
     def test_cli_timeout_leaves_no_late_write_in_the_verifier_tree(self):
         command, pidfile = self.late_writer("sleep 30", delay=2)  # the review's repro: writes 2 s in, timeout 1 s
         self.lock(command=command)
@@ -269,6 +285,7 @@ class VerifyTest(unittest.TestCase):
         self.assert_writer_gone_and_nothing_landed(pidfile, delay=2)
         self.assertEqual(json.loads(done.stdout)["cleanup"], True)
 
+    @posix_verify
     def test_a_command_that_kills_its_holder_is_a_fail_and_its_background_writer_is_killed_too(self):
         # The holder (group leader) dies before orchd's SIGKILL; as orchd's unreaped child it still reserves the
         # group id, so the group kill reaches the writer and nothing unrelated.
@@ -282,11 +299,13 @@ class VerifyTest(unittest.TestCase):
                          (None, False, True, False, True))
         self.assertIn("without an exit status", result["tail"])
 
+    @posix_verify
     def test_signal_exit_status_is_kept_and_fails(self):
         self.lock(command="kill -TERM $$")
         result = verify.run(self.con, "V")
         self.assertEqual((result["exit"], result["passed"], result["cleanup"]), (-15, False, True))
 
+    @posix_verify
     def test_unconfirmed_cleanup_is_a_fail_and_the_tree_stays_at_the_locked_sha(self):
         # No test process can be made unkillable, so pretend the group never empties.
         lock = self.lock(command="true")
@@ -299,6 +318,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(git(self.wv, "rev-parse", "HEAD"), lock["sha"])
         self.assertEqual(verify.status(self.con, "A")["state"], "fail")
 
+    @posix_verify
     def test_an_exception_after_the_checkout_restores_a_clean_tree_and_is_recorded(self):
         self.lock()
         real, calls = verify._dirty, []
@@ -316,6 +336,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual((row["passed"], row["restored"]), (False, True))
         self.assertEqual(verify.status(self.con, "A")["state"], "fail")
 
+    @posix_verify
     def test_an_exception_with_a_dirty_tree_keeps_the_files_and_does_not_restore(self):
         lock = self.lock(command="echo mine > output.txt")
         real, calls = verify._dirty, []
@@ -332,6 +353,7 @@ class VerifyTest(unittest.TestCase):
         row = json.loads(self.con.execute("SELECT evidence FROM messages WHERE kind=?", (verify.RESULT,)).fetchone()[0])
         self.assertEqual((row["passed"], row["restored"]), (False, False))
 
+    @posix_verify
     def test_a_failed_restore_is_recorded_and_returned(self):
         # git refuses to switch while the worktree's index is locked; status still works.
         self.lock(command='touch "$(git rev-parse --git-path index.lock)"')
@@ -341,6 +363,7 @@ class VerifyTest(unittest.TestCase):
         row = json.loads(self.con.execute("SELECT evidence FROM messages WHERE kind=?", (verify.RESULT,)).fetchone()[0])
         self.assertEqual((row["restored"], row["restore_error"]), (False, result["restore_error"]))
 
+    @posix_verify
     def test_new_author_commit_makes_a_pass_stale_until_relocked_and_rerun(self):
         self.lock()
         self.assertTrue(verify.run(self.con, "V")["passed"])
@@ -352,6 +375,7 @@ class VerifyTest(unittest.TestCase):
         self.assertTrue(verify.run(self.con, "V")["passed"])
         self.assertEqual(verify.status(self.con, "A")["state"], "pass")
 
+    @posix_verify
     def test_stale_tracks_the_branch_even_after_the_author_worktree_is_gone(self):
         self.lock()
         verify.run(self.con, "V")
@@ -360,6 +384,7 @@ class VerifyTest(unittest.TestCase):
         git(self.repo, "update-ref", "refs/heads/orchd/A", git(self.repo, "rev-parse", "main"))
         self.assertEqual(verify.status(self.con, "A")["state"], "stale")
 
+    @posix_verify
     def test_recorded_passed_flag_is_not_trusted(self):
         self.lock(command="exit 1")
         verify.run(self.con, "V")
@@ -370,6 +395,7 @@ class VerifyTest(unittest.TestCase):
 
     # --- surfaces ---------------------------------------------------------------------------------------
 
+    @posix_verify
     def test_inbox_shows_verification_and_skips_git_for_tasks_without_a_lock(self):
         rt = FakeRuntime()
         self.lock()
@@ -417,6 +443,7 @@ class VerifyTest(unittest.TestCase):
 
     # --- host capabilities: checked before anything is checked out --------------------------------------
 
+    @posix_verify
     def test_this_host_has_what_verify_needs(self):
         self.assertEqual(verify.unsupported(), [])
 
@@ -427,6 +454,7 @@ class VerifyTest(unittest.TestCase):
         self.assertIsNone(self.con.execute("SELECT 1 FROM messages WHERE kind=?", (verify.RESULT,)).fetchone())
         self.assertEqual(verify.status(self.con, "A")["state"], "locked")
 
+    @posix_verify
     def test_a_host_without_process_group_kill_is_refused_before_the_checkout(self):
         self.lock()
         head = git(self.wv, "rev-parse", "HEAD")
@@ -443,6 +471,7 @@ class VerifyTest(unittest.TestCase):
             verify.run(self.con, "V")
         self.assert_untouched_after_refusal(head)
 
+    @posix_verify
     def test_cli_refuses_with_exit_2_on_a_host_without_process_group_kill(self):
         self.lock()
         head = git(self.wv, "rev-parse", "HEAD")
@@ -457,6 +486,7 @@ class VerifyTest(unittest.TestCase):
         self.assertNotIn("Traceback", done.stderr)
         self.assert_untouched_after_refusal(head)
 
+    @posix_verify
     def test_cli_exit_codes_pass_fail_refused(self):
         env = dict(os.environ, ORCHD_HOME=str(self.home))
         run = lambda: subprocess.run([sys.executable, str(CLI), "verify", "V"], capture_output=True, text=True, env=env)

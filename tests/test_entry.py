@@ -807,7 +807,9 @@ class InterfaceTest(unittest.TestCase):
 
     def test_reports_codex_trust_without_writing_it(self):
         self.assertFalse(self.interface()["codex_trusted"])
-        self.codex_cfg.write_text(f'[projects."{self.home.resolve()}"]\ntrust_level = "trusted"\n')
+        # json.dumps escapes Windows backslashes into a valid TOML basic string, as `orchd init` writes it.
+        self.codex_cfg.write_text(f'[projects.{json.dumps(str(self.home.resolve()))}]\ntrust_level = "trusted"\n',
+                                  encoding="utf-8")
         result = self.interface()
         self.assertTrue(result["codex_trusted"])
         self.assertIn("start talking", result["next"])
@@ -844,9 +846,10 @@ class BindingCliTest(unittest.TestCase):
     def test_modes(self):
         import contextlib, io
         from orchd import cli
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as closing:
             rt = EntryRuntime()
             con = store.connect(Path(tmp) / "orchd.db")
+            closing.callback(con.close)  # before the temp dir is removed (Windows cannot delete an open db)
             orch = core.start_orch(con, rt, "opus")["id"]
             def run(*argv):
                 out, err = io.StringIO(), io.StringIO()
@@ -861,6 +864,7 @@ class BindingCliTest(unittest.TestCase):
             code, out, _ = run("binding", "--status")
             self.assertEqual((code, json.loads(out)["orch_id"]), (0, orch))
             con2 = store.connect(Path(tmp) / "orchd.db")
+            closing.callback(con2.close)
             self.assertEqual(entry.get_entry(con2, "desktop")["orch_id"], orch)
             for old in ("interface", "entry-bind", "entry-status"):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -917,7 +921,7 @@ class RolloutSourceTest(unittest.TestCase):
                 {"type": "response_item", "payload": {"type": "message", "role": "user",
                                                       "content": [{"type": "input_text", "text": "dup"}]}},
             ]
-            path.write_text("".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines) + "not json\n")
+            path.write_text("".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines) + "not json\n", encoding="utf-8")
             with patch.dict(os.environ, {"ORCHD_CODEX_SESSIONS": root}):
                 got = Runtime().codex_user_messages("thread-X")
                 self.assertEqual(got, [{"turn_id": "t1", "item_id": "i1", "text": BODY}])

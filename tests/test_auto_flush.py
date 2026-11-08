@@ -13,6 +13,10 @@ from unittest.mock import patch
 from orchd import cli, core, mcp_server, store
 from orchd.runtime import Runtime
 from tests.test_orchd import FakeRuntime
+from tests.portability import posix_only
+
+EXEC_WRAPPER = posix_only("the Codex exec turn wrapper is /bin/sh running shebang stubs, stopped through killpg; "
+                          "native Windows uses the app-server backend")
 
 
 class Base(unittest.TestCase):
@@ -235,6 +239,7 @@ class BriefTest(unittest.TestCase):
         self.assertNotIn("Keep every turn short", claude)
 
 
+@EXEC_WRAPPER
 class WrapperCleanupTest(unittest.TestCase):
     """macOS psutil cannot read the sh wrapper's own ORCHD_WORKTREE (only its children's): close and interrupt must
     still stop the wrapper and the codex child, through the args match and killpg, not through the env mark."""
@@ -308,6 +313,7 @@ class WrapperCleanupTest(unittest.TestCase):
 class TurnWrapperTest(unittest.TestCase):
     """The real shell wrapper, with stub codex and stub orchd executables."""
 
+    @EXEC_WRAPPER
     def test_flush_runs_after_codex_exits_with_the_wrappers_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

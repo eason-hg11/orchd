@@ -89,7 +89,7 @@ class Env:
             return self.runner(argv) if input is None else self.runner(argv, input=input)
         child = dict(self.environ, HOME=str(self.home)) if argv[0] == "git" else dict(self.environ)
         try:
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=child,
+            p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=child,
                                **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}))
             return p.returncode, p.stdout + p.stderr
         except (OSError, subprocess.SubprocessError):
@@ -163,7 +163,7 @@ def q(path):
 
 def read_json(path):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -175,7 +175,7 @@ def read_toml(path):
     if tomllib is None:
         return None
     try:
-        return tomllib.loads(Path(path).read_text())
+        return tomllib.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -246,7 +246,12 @@ def read_public_key(env, pub):
     if pub.parent != env.home / ".ssh" or pub.suffix != ".pub":
         return None
     try:
-        fd = os.open(pub, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if hasattr(os, "O_NOFOLLOW"):
+            fd = os.open(pub, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        else:  # Windows: no O_NOFOLLOW (or FIFOs); refuse a symlink or other reparse point before opening
+            if os.lstat(pub).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:  # symlinks are reparse points
+                return None
+            fd = os.open(pub, os.O_RDONLY | os.O_BINARY)
     except OSError:
         return None
     try:
@@ -284,7 +289,7 @@ def pub_key_ok(env, key):
 
 def ssh_hosts(env):
     try:
-        text = (env.home / ".ssh" / "config").read_text()
+        text = (env.home / ".ssh" / "config").read_text(encoding="utf-8")
     except OSError:
         return None
     hosts = set()

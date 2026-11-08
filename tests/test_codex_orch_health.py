@@ -3,7 +3,6 @@ import contextlib
 import io
 import json
 import os
-import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +10,14 @@ from unittest.mock import Mock, patch
 
 import psutil
 
-from orchd import app_worker, cli, codex_orch, interface, inventory, store
+from orchd import app_worker, cli, codex_orch, interface, inventory, store, unix_socket
 from orchd.orch_health import owner_health
 from tests.test_orchd import FakeRuntime
+from tests.portability import posix_only
+
+# codex_orch.private_socket proves the endpoint private by owner uid and a 0700 directory, so on Windows every
+# probe stops at codex_socket_unavailable before the RPC.
+PRIVATE_SOCKET = posix_only("the Codex probe's private-socket check uses owner uid and 0700 directory modes")
 
 
 class CodexOrchHealthTest(unittest.TestCase):
@@ -26,8 +30,8 @@ class CodexOrchHealthTest(unittest.TestCase):
         self.addCleanup(self.con.close)
         store.register_orch(self.con, 'thread', 'codex')
         self.endpoint = str(self.directory / 'app.sock')
-        self.socket = socket.socket(socket.AF_UNIX)
-        self.socket.bind(self.endpoint)
+        self.socket = unix_socket.create()
+        unix_socket.bind(self.socket, self.endpoint)
         self.addCleanup(self.socket.close)
         self.spec = dict(backend='app-server', endpoint=self.endpoint, thread_id='thread',
                          server_identity=app_worker.identity(os.getpid()))
@@ -48,6 +52,7 @@ class CodexOrchHealthTest(unittest.TestCase):
     def assertHealth(self, state, reason):
         self.assertEqual(self.health(), dict(state=state, reason=reason))
 
+    @PRIVATE_SOCKET
     def test_active_and_idle_require_matching_thread_and_live_identity(self):
         for status, state in (('active', 'alive'), ('idle', 'idle')):
             with self.subTest(status=status):
@@ -74,10 +79,12 @@ class CodexOrchHealthTest(unittest.TestCase):
             self.assertHealth('unknown', 'codex_process_unavailable')
         self.factory.assert_not_called()
 
+    @PRIVATE_SOCKET
     def test_process_exit_during_rpc_does_not_leave_alive(self):
         with patch.object(app_worker, 'process', side_effect=[Mock(), None]):
             self.assertHealth('dead', 'codex_process_gone')
 
+    @PRIVATE_SOCKET
     def test_socket_connection_timeout_and_rpc_error_are_unknown_and_redacted(self):
         for error in (ConnectionRefusedError('SECRET'), TimeoutError('SECRET'), RuntimeError('SECRET')):
             with self.subTest(error=error), patch.object(codex_orch, 'RPC', side_effect=error):
@@ -86,6 +93,7 @@ class CodexOrchHealthTest(unittest.TestCase):
         self.assertHealth('unknown', 'codex_socket_unavailable')
         self.rpc.close.assert_called()
 
+    @PRIVATE_SOCKET
     def test_private_socket_missing_public_directory_and_symlink_are_unknown(self):
         for mode in (0o755, 0o777):
             self.directory.chmod(mode)
@@ -101,6 +109,7 @@ class CodexOrchHealthTest(unittest.TestCase):
         self.assertHealth('unknown', 'codex_socket_unavailable')
         self.factory.assert_not_called()
 
+    @PRIVATE_SOCKET
     def test_thread_mismatch_and_unrecognized_status_are_unknown(self):
         self.rpc.call.return_value['thread']['id'] = 'other'
         self.assertHealth('unknown', 'codex_thread_mismatch')
@@ -130,6 +139,7 @@ class CodexOrchHealthTest(unittest.TestCase):
         self.assertEqual(row['capabilities']['health_probe'], 'unsupported')
         self.assertFalse(row['capabilities']['process_identity'])
 
+    @PRIVATE_SOCKET
     def test_json_inventory_exposes_reason_and_capabilities_without_probe_secrets(self):
         self.rpc.call.return_value['thread']['status']['type'] = 'idle'
         report = inventory.list_orchs(self.con, self.rt)
@@ -145,6 +155,7 @@ class CodexOrchHealthTest(unittest.TestCase):
             self.assertEqual(cli.main(['orch', 'list', '--json']), 0)
         self.assertEqual(json.loads(out.getvalue())['orchs'][0]['health_reason'], 'codex_thread_idle')
 
+    @PRIVATE_SOCKET
     def test_registration_cli_captures_identity_and_rejects_unverified_server(self):
         self.con.execute('UPDATE orchs SET codex_probe=NULL')
         with patch.dict(os.environ, {'ORCHD_HOME': str(self.directory)}), \

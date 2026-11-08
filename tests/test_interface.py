@@ -350,7 +350,7 @@ class InterfaceTest(unittest.TestCase):
         self.con.execute('ALTER TABLE interface_requests DROP COLUMN interim_ack_at')
         self.con.execute('ALTER TABLE interface_requests DROP COLUMN interim')
         self.con.close()
-        self.con = store.connect()
+        store.connect().close()
         self.con = store.connect()  # idempotent
         self.assertEqual(self.fetch(), [dict(request_id=rid, conversation='one', reply='old final')])
         rid2 = self.submit(key='2')['request_id']

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from orchd import app_worker, core, store
 from tests.app_support import AppBase
+from tests.portability import WINDOWS, posix_only
 
 
 class ReviewRegressionTest(AppBase):
@@ -34,6 +35,9 @@ with tempfile.TemporaryDirectory() as tmp:
         self.assertEqual(app_worker.health(task), 'dead')
         with patch.object(app_worker, 'process', return_value=object()):
             self.assertEqual(app_worker.health(task), 'unknown')
+        if WINDOWS:
+            self.skipTest("POSIX only: signals recorded identities one by one; Windows stops the worker's Job Object "
+                          "(tests/test_windows_job.py)")
         with patch.object(app_worker, 'stop_identity') as stop:
             app_worker.stop(self.con, task)
         self.assertEqual(stop.call_count, 2)
@@ -43,6 +47,7 @@ with tempfile.TemporaryDirectory() as tmp:
         self.assertTrue(core.close(self.con, self.rt, self.id)['closed'])
         self.assertEqual(store.get_task(self.con, self.id)['status'], 'closed')
 
+    @posix_only("stops a process outside any job; Windows refuses that by design (tests/test_windows_cleanup.py)")
     def test_missing_runtime_still_stops_owned_process(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
                                  start_new_session=True)

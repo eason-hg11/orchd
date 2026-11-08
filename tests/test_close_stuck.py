@@ -10,7 +10,8 @@ from unittest import mock
 import psutil
 
 from orchd import core, processes, store
-from tests.test_close_recovery import CloseSubmoduleTest, git
+from tests import test_close_recovery as recovery  # a module-level class name would be collected and rerun
+from tests.test_close_recovery import git
 
 
 class DeadPidTest(unittest.TestCase):
@@ -29,7 +30,7 @@ class DeadPidTest(unittest.TestCase):
         self.assertEqual(receipt["killed"], [])
 
 
-class StuckCloseTest(CloseSubmoduleTest):
+class StuckCloseTest(recovery.CloseSubmoduleTest):
     def test_close_succeeds_when_task_pid_vanishes_mid_scan_and_still_stops_the_live_one(self):
         env = dict(os.environ, ORCHD_WORKTREE=str(Path(self.wt).resolve()))
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
@@ -85,7 +86,7 @@ class StuckCloseTest(CloseSubmoduleTest):
         self.assertEqual(core.stuck_closes(self.con), [])
 
 
-for _name in dir(CloseSubmoduleTest):  # reuse the fixture only; do not rerun the inherited tests
+for _name in dir(recovery.CloseSubmoduleTest):  # reuse the fixture only; do not rerun the inherited tests
     if _name.startswith("test_") and _name not in StuckCloseTest.__dict__:
         setattr(StuckCloseTest, _name, None)
 

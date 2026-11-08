@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchd import store
+from tests.portability import posix_only
 
 SPEC = importlib.util.spec_from_file_location("demo_reset", Path(__file__).resolve().parents[1] / "scripts/demo-reset.py")
 demo_reset = importlib.util.module_from_spec(SPEC)
@@ -27,6 +28,7 @@ def sh(*cmd, cwd=None):
                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout.strip()
 
 
+@posix_only("demo-reset.py holds directories by descriptor (os.O_DIRECTORY, fchdir) and probes AF_UNIX worker sockets under /tmp")
 class DemoResetTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dr-", dir="/tmp")).resolve()  # short: AF_UNIX paths max ~104 bytes

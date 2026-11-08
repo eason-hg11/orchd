@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import tempfile
@@ -141,7 +142,8 @@ class UpgradeTests(unittest.TestCase):
     def test_migration_failure_rolls_back_all_schema_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "old.db"
-            with sqlite3.connect(path) as old:
+            # closing(): sqlite3's own context manager only commits; Windows cannot remove an open db.
+            with contextlib.closing(sqlite3.connect(path)) as old:
                 cut = store.SCHEMA.index("CREATE TABLE IF NOT EXISTS intake_content")
                 old.executescript(store.SCHEMA[:cut])
                 before = old.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall()
@@ -150,12 +152,12 @@ class UpgradeTests(unittest.TestCase):
             with patch.object(store, "SCHEMA", broken):
                 with self.assertRaises(sqlite3.DatabaseError):
                     store.connect(path)
-            with sqlite3.connect(path) as reopened:
+            with contextlib.closing(sqlite3.connect(path)) as reopened:
                 self.assertEqual(reopened.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall(), before)
             store.connect(path).close()
 
     def test_existing_db_gains_tables_and_old_rows_still_read(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as closing:
             path = Path(temp) / "old.db"
             old = sqlite3.connect(path)
             old.row_factory = sqlite3.Row
@@ -168,7 +170,7 @@ class UpgradeTests(unittest.TestCase):
             old.commit()
             old.close()
             con = store.connect(path)
-            self.addCleanup(con.close)
+            closing.callback(con.close)  # before the temp dir is removed
             for table in ("intake_content", "intake_suggestions", "intake_notifications", "intake_decisions"):
                 self.assertIn(table, table_names(con))
             view = intake.project(con, table_names(con), 5)

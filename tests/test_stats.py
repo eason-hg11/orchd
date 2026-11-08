@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from orchd import stats, store
+from tests.portability import WINDOWS
 
 T0 = 1_000_000.0  # window start used by most tests
 
@@ -799,8 +800,9 @@ class StatsTest(unittest.TestCase):
         snap = stats.open_snapshot(path)
         d = Path(snap._dir)
         self.assertNotEqual(d, self.root)
-        self.assertEqual(d.stat().st_mode & 0o777, 0o700)
-        self.assertTrue(all(p.stat().st_mode & 0o077 == 0 for p in d.iterdir()))
+        if not WINDOWS:  # POSIX modes; on Windows mkdtemp's %TEMP% is private by the profile ACL, st_mode reports 0o777
+            self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(all(p.stat().st_mode & 0o077 == 0 for p in d.iterdir()))
         stats.stats(snap.con, None, self.claude, self.codex)    # old schema: no task_type etc., no migration
         snap.close()
         self.assertFalse(d.exists())

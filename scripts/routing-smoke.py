@@ -36,7 +36,9 @@ class ProcessRuntime(Runtime):
     def worker(self, worktree, model):
         # Child announces readiness, then waits. A second
         # dispatch returns while the first remains alive, proving overlap.
-        child = subprocess.Popen([sys.executable, '-u', '-c',
+        # The fixture child is stdlib-only. A Windows venv python.exe is a launcher that runs the real interpreter
+        # as a second process, so its os.getpid() would not be child.pid; start the base interpreter directly.
+        child = subprocess.Popen([getattr(sys, '_base_executable', sys.executable), '-u', '-c',
             'import json,os,time; print(json.dumps({"pid":os.getpid(),"cwd":os.getcwd()})); time.sleep(300)',
             'codex-fixture', worktree],
             cwd=worktree, env=dict(os.environ, ORCHD_WORKTREE=worktree),
