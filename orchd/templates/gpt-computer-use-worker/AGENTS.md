@@ -25,4 +25,9 @@ and sites; ask the Operator if that scope is missing or insufficient.
 6. Finish with exactly one `orchd report <task-id> --status done|blocked
    --summary "<one line>" --evidence "<screenshots, results, unverified work>"`.
    Report facts and remaining limitations; keep code changes in the orchd repo.
+7. A task can arrive as an injected message `[orchd task <task-id>]` in this session (no
+   worktree exists). Use that task id. Until an answer approves it, take read-only
+   actions only: observe, screenshot, read. After `orchd ask`, end the turn: the
+   answer arrives later as an injected message `[orchd answer <task-id>]`. Handle
+   one task at a time.
 <!-- orchd:managed:end -->
