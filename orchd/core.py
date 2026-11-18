@@ -2,6 +2,7 @@
 import contextlib
 import json
 import os
+import re
 import shlex
 import sqlite3
 import time
@@ -167,6 +168,85 @@ FOUND_BY = ("verify", "review", "orch", "nat")
 OUTCOMES = ("merged", "abandoned", "parked", "done")
 
 
+DESKTOP = "desktop"
+DESKTOP_MODEL = "gpt-desktop-computer-use"  # a label: the Desktop session owns the real model
+DESKTOP_THREAD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")  # first char alphanumeric: never parsed as an option
+UNVERIFIED_SOURCE = "desktop-unverified"  # task ids are the only credential: Orch treats these events as untrusted data
+
+
+def is_desktop(task):
+    return dict(task).get("backend") == DESKTOP
+
+
+def desktop_message(task):
+    """The text injected into the Desktop thread. No worktree, branch or repo checkout exists for this task."""
+    cli, tid = worker_cli(), task["id"]
+    return f"""[orchd task {tid}]
+Repo: {task['repo']}
+Title: {task['title']}
+Task type: {task['task_type'] or 'unspecified'}
+
+Instructions:
+{task['instructions']}
+
+Done when:
+{task['done_when']}
+
+Rules for this Desktop computer-use task (no worktree exists; do not edit code):
+- Read-only actions only: observe, screenshot, read. Before any send, post, submit, purchase or settings change, run
+  `{cli} ask {tid} "<question>"` with the exact action and content, then end your turn. Only a later message
+  `[orchd answer {tid}]` approving that exact action authorizes it.
+- Never type passwords, OTP codes or payment details; never print secrets.
+- Report progress with `{cli} progress {tid} "<text>"` and finish with exactly one
+  `{cli} report {tid} --status done|blocked --summary "<one line>" --evidence "<what you saw, what is unverified>"`.
+
+Start with: {cli} ack {tid}"""
+
+
+def _dispatch_desktop(con, rt, *, orch_thread, repo, title, instructions, done_when, model_reason, task_type,
+                      issue_ref, desktop_thread, unsupported):
+    """Queue a task into a long-lived Desktop thread (#84): no worktree, no worker process, no model choice.
+    The task text goes in through `codex queue --thread`, the same path as an Orch wake-up. Whether that wakes a
+    thread whose turn has ended is unverified. ack/progress/ask/report come back through the orchd CLI."""
+    if not isinstance(desktop_thread, str) or not DESKTOP_THREAD_RE.fullmatch(desktop_thread):
+        raise ValueError("desktop_thread must be 1-128 characters of letters, digits, '-' or '_', starting with a letter or digit")
+    given = sorted(k for k, v in unsupported.items() if v is not None)
+    if given:
+        raise ValueError(f"backend desktop does not support {', '.join(given)}")
+    if not isinstance(model_reason, str) or not model_reason.strip():
+        raise ValueError("dispatch needs a non-empty model_reason")
+    _choice("task_type", task_type, TASK_TYPES)
+    if issue_ref is not None:
+        from . import issue_links
+        issue_links.validate_ref(issue_ref)
+    repo_path = rt.repo_path(repo)
+    task_id = store.new_task_id()
+    with store.immediate(con):
+        busy = con.execute("SELECT id FROM tasks WHERE backend=? AND desktop_thread=? AND status IN "
+                           f"({','.join('?' * len(store.OPEN))}) AND status NOT IN ('failed','done') LIMIT 1",
+                           (DESKTOP, desktop_thread, *store.OPEN)).fetchone()
+        if busy:
+            raise ValueError(f"desktop thread {desktop_thread} already has open task {busy['id']}; "
+                             "close it or wait for its report first")
+        task = store.create_task(con, id=task_id, repo=repo, repo_path=str(repo_path), title=title,
+                                 instructions=instructions, done_when=done_when, orch_thread=orch_thread,
+                                 codex_bin=rt.codex, model=DESKTOP_MODEL, model_reason=model_reason,
+                                 task_type=task_type, backend=DESKTOP, desktop_thread=desktop_thread)
+        store.add_message(con, task_id, "dispatch", json.dumps(
+            dict(model=DESKTOP_MODEL, model_reason=model_reason, task_type=task_type, backend=DESKTOP,
+                 desktop_thread=desktop_thread, quota_shadow=None, source=UNVERIFIED_SOURCE), ensure_ascii=False))
+    try:
+        rt.wake_orch(rt.codex, desktop_thread, desktop_message(task))
+    except Exception as error:
+        store.update_task(con, task_id, status="failed", note=f"{type(error).__name__}: {error}"[:1000])
+        raise
+    con.execute("UPDATE tasks SET status='running' WHERE id=? AND status='starting'", (task_id,))
+    if issue_ref is not None:
+        from . import issue_links
+        issue_links.link(con, task_id, issue_ref, actor="orch", idempotency_key="dispatch:issue_ref")
+    return store.get_task(con, task_id)
+
+
 def _choice(name, value, valid):
     if value not in valid:
         raise ValueError(f"unknown {name} {value!r}; use one of {', '.join(valid)}")
@@ -175,12 +255,24 @@ def _choice(name, value, valid):
 def dispatch(con, rt, *, orch_thread, repo, title, instructions, done_when, model=None,
              model_reason=None, task_type=None, rework_of=None, found_by=None, verify=None, manual_checks=None,
              verifies=None, backend=None, goal_id=None, goal_critical=None, issue_ref=None, group_id=None,
-             base_branch=None, workflow=None, workflow_stage=None, workflow_inputs=None, _run_attempt=None, attachment_refs=None):
+             base_branch=None, workflow=None, workflow_stage=None, workflow_inputs=None, _run_attempt=None, attachment_refs=None, desktop_thread=None):
     from . import issue_links
     if issue_ref is not None:
         issue_links.validate_ref(issue_ref)
     if not orch_thread:
         raise ValueError("dispatch needs the caller's thread id")
+    if backend == DESKTOP:
+        return _dispatch_desktop(con, rt, orch_thread=orch_thread, repo=repo, title=title, instructions=instructions,
+                                 done_when=done_when, model_reason=model_reason, task_type=task_type,
+                                 issue_ref=issue_ref, desktop_thread=desktop_thread,
+                                 unsupported=dict(model=model, rework_of=rework_of, found_by=found_by, verify=verify,
+                                                  manual_checks=manual_checks, verifies=verifies, goal_id=goal_id,
+                                                  goal_critical=goal_critical, group_id=group_id,
+                                                  base_branch=base_branch, workflow=workflow,
+                                                  workflow_stage=workflow_stage, workflow_inputs=workflow_inputs,
+                                                  attachment_refs=attachment_refs, _run_attempt=_run_attempt))
+    if desktop_thread is not None:
+        raise ValueError("desktop_thread is only valid with backend=desktop")
     repo_path = rt.repo_path(repo)
     if Path(repo_path).name != repo:
         raise ValueError('Dispatch requires the registered repo directory name, not a path alias')
@@ -620,7 +712,8 @@ def inbox_page(con, orch_thread, group_id=None, limit=INBOX_DEFAULT_LIMIT, *, re
             state = _inbox_verification(con, task)
             info[r["task_id"]] = (store.pending_answer_count(con, r["task_id"]), state)
         pending, state = info[r["task_id"]]
-        return dict(**_inbox_metadata_preview(dict(task_id=r["task_id"], repo=r["repo"], kind=r["kind"],
+        source = {"source": UNVERIFIED_SOURCE} if r["backend"] == DESKTOP else {}
+        return dict(**source, **_inbox_metadata_preview(dict(task_id=r["task_id"], repo=r["repo"], kind=r["kind"],
                     task_status=r["status"], model=task_model(r), group_id=r["group_id"], verification=state)),
                     title=_inbox_preview(r["title"], "title"),
                     body=_inbox_preview(r["body"], "body"), evidence=_inbox_preview(r["evidence"], "evidence"),
@@ -798,6 +891,10 @@ def _answer(con, rt, task_id, text=None, flush=False, accept=None, finished_pid=
         raise ValueError(f"task {task_id} is closed")
     if text is None and not flush:
         raise ValueError("answer needs text, or flush=true to send queued answers")
+    if is_desktop(task):
+        if interrupt:
+            raise ValueError(f"task {task_id}: a desktop thread cannot be interrupted; use followup or answer")
+        return _answer_desktop(con, rt, task_id, text, accept, entry_reply_id)
     if app_worker.enabled(task):
         if text is not None:
             _queue_answer(con, task_id, text, accept, entry_reply_id)
@@ -879,6 +976,39 @@ def _answer(con, rt, task_id, text=None, flush=False, accept=None, finished_pid=
                     error=f"{type(error).__name__}: {error}"[:500])
 
 
+def _answer_desktop(con, rt, task_id, text, accept, entry_reply_id):
+    """Queue the answer first, then inject every queued answer into the task's Desktop thread in one message.
+    The receipt (read_at plus one `answer` row each) is written only after the queue call succeeded, so a failed
+    injection keeps everything queued for `answer(flush=true)`. Delivery is at least once: a crash between the
+    injection and the receipt can send it again."""
+    if text is not None:
+        _queue_answer(con, task_id, text, accept, entry_reply_id)
+    try:
+        with store.task_delivery(con, [task_id]):
+            task = store.get_task(con, task_id)
+            if task["status"] == "closed":
+                raise ValueError(f"task {task_id} is closed; its queued answers stay undelivered")
+            pending = store.pending_answers(con, task_id)
+            if not pending:
+                return dict(status="delivered", delivered=0, pending=0)
+            message = "\n\n".join(f"[orchd answer {task_id}]\n{row['body']}" for row in pending)
+            try:
+                rt.wake_orch(task["codex_bin"], task["desktop_thread"], message)
+            except Exception as error:
+                return dict(status="failed", delivered=0, pending=len(pending),
+                            error=f"{type(error).__name__}: {error}"[:500])
+            with store.immediate(con):
+                store.mark_read(con, [row["id"] for row in pending])
+                for row in pending:
+                    store.add_message(con, task_id, "answer", row["body"], evidence=row["evidence"],
+                                      entry_reply_id=row["entry_reply_id"])
+                store.update_task(con, task_id, status="acked")
+            return dict(status="delivered", delivered=len(pending), pending=0)
+    except TimeoutError:
+        return dict(status="queued", delivered=0, pending=store.pending_answer_count(con, task_id),
+                    error="task busy (close in progress); flush again once it finishes")
+
+
 def _resume_queued(con, rt, task, finished_pid=None):
     """Send a Codex worker's queued answers as one new turn. The caller holds the task delivery lock and has just
     re-read `task` under it. `finished_pid`: the auto flush's turn wrapper; if the task's job is no longer that
@@ -920,6 +1050,8 @@ def auto_flush(con, rt, task_id, after_pid=None, generation=None, thread=None, t
         task = store.get_task(con, task_id)
         if task["status"] == "closed":
             return dict(status="skipped", reason="closed")
+        if is_desktop(task):
+            return dict(status="skipped", reason="desktop task")
         if app_worker.enabled(task):
             if after_pid is not None:
                 return dict(status="skipped", reason="legacy wrapper")
@@ -994,6 +1126,8 @@ def interrupt(con, rt, task_id, text):
     task = store.get_task(con, task_id)
     if task["status"] == "closed":
         raise ValueError(f"task {task_id} is closed")
+    if is_desktop(task):
+        raise ValueError(f"task {task_id}: a desktop thread cannot be interrupted; use followup or answer")
     if app_worker.enabled(task):
         _queue_answer(con, task_id, "[interrupt] Codex cancelled your running turn. Check git status and "
                       f"any detached jobs before continuing; run ack, then follow this correction.\n\n{text}", None)
@@ -1199,7 +1333,9 @@ def list_open(con, rt, *, now=None, stale_hours=None, attention_only=False):
     hours = worker_health.stale_hours(stale_hours)
     heard_by_task = worker_health.worker_messages(con, store.OPEN)
     for t in store.open_tasks(con):
-        if app_worker.enabled(t):
+        if is_desktop(t):
+            alive = None  # a Desktop session has no process orchd can probe
+        elif app_worker.enabled(t):
             alive = app_worker.health(t)
         elif worker_kind(t["model"]) == "codex":  # between turns there is no process, only a resumable thread
             alive = True if t["job_id"] and rt.pid_alive(t["job_id"]) else (
@@ -1212,6 +1348,7 @@ def list_open(con, rt, *, now=None, stale_hours=None, attention_only=False):
                                       task_id=t["id"], worktree=t["worktree"], branch=t["branch"], base=t["base"])
         out.append(dict(task_id=t["id"], repo=t["repo"], title=t["title"], status=t["status"],
                         model=task_model(t), model_reason=limits.cap_text(t['model_reason']), group_id=t['group_id'],
+                        **({"source": UNVERIFIED_SOURCE} if is_desktop(t) else {}),
                         **retry_summary(con, t['id']),
                         auto_model=bool(t['auto_model']), auto_retry_count=t['auto_retry_count'],
                         worker_alive=alive, goal_id=t["goal_id"], goal_critical=t["goal_critical"],
@@ -1356,6 +1493,9 @@ def _close_locked(con, rt, task_id, outcome, rating):
 
 def view(con, rt, task_id):
     task = store.get_task(con, task_id)
+    if is_desktop(task):
+        return (f"desktop thread {task['desktop_thread']}: codex://threads/{task['desktop_thread']} "
+                "(open it in the Desktop app; nothing was launched)")
     if app_worker.enabled(task):
         if task["status"] == "closed" or app_worker.health(task) not in ("alive", "idle", "active"):
             raise ValueError("app-server worker unavailable; inspect health before viewing")
@@ -1520,6 +1660,9 @@ def retry(con, rt, task_id, model, reason, lock_wait=RETRY_LOCK_WAIT, backend=No
     no other lifecycle step in between. The SQLite write lock is only held for the final commit."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("retry needs a non-empty reason")
+    if is_desktop(store.get_task(con, task_id)):
+        raise ValueError(f"task {task_id} runs on a desktop thread: it has no worktree to continue in, retry is not "
+                         "supported; close it and dispatch again")
     if model == "escalate":  # the task's current worker failed it: next tier, other vendor first
         model = models.escalate(store.get_task(con, task_id)["model"])
     _choice("model", model, tuple(WORKER_MODELS))

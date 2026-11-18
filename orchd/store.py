@@ -368,7 +368,7 @@ TASK_COLUMNS = ("goal_id TEXT REFERENCES goals(id)", "goal_critical INTEGER CHEC
                 "backend TEXT NOT NULL DEFAULT 'exec'", "generation TEXT", "endpoint TEXT",
                 "control_endpoint TEXT", "supervisor_identity TEXT", "server_identity TEXT",
                 "active_turn TEXT", "turn_state TEXT", "last_completed_turn TEXT", "base_branch TEXT",
-                "remote_branch TEXT", "remote_repo TEXT")
+                "remote_branch TEXT", "remote_repo TEXT", "desktop_thread TEXT")
 MESSAGE_COLUMNS = ("recipient_orch TEXT", "notice_error TEXT", "notice_recipient TEXT",
                    "entry_reply_id INTEGER REFERENCES entry_messages(id)")
 ORCH_COLUMNS = ("first_seen_dead REAL", "last_verified_dead REAL", "archived_at REAL", "codex_probe TEXT")
@@ -576,7 +576,7 @@ def add_message(con, task_id, kind, body, evidence=None, *, entry_reply_id=None)
 
 def unread_for_thread(con, thread):
     return con.execute(
-        "SELECT m.*, t.repo, t.title, t.status, t.model, t.model_reason, t.group_id FROM messages m JOIN tasks t ON t.id=m.task_id "
+        "SELECT m.*, t.repo, t.title, t.status, t.model, t.model_reason, t.group_id, t.backend FROM messages m JOIN tasks t ON t.id=m.task_id "
         f"WHERE t.orch_thread=? AND m.read_at IS NULL AND m.kind IN ({','.join('?' * len(ORCH_KINDS))}) "
         "ORDER BY m.id", (thread, *ORCH_KINDS)).fetchall()
 
