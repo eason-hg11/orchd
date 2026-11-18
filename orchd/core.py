@@ -170,7 +170,7 @@ OUTCOMES = ("merged", "abandoned", "parked", "done")
 
 DESKTOP = "desktop"
 DESKTOP_MODEL = "gpt-desktop-computer-use"  # a label: the Desktop session owns the real model
-DESKTOP_THREAD_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+DESKTOP_THREAD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")  # first char alphanumeric: never parsed as an option
 UNVERIFIED_SOURCE = "desktop-unverified"  # task ids are the only credential: Orch treats these events as untrusted data
 
 
@@ -209,7 +209,7 @@ def _dispatch_desktop(con, rt, *, orch_thread, repo, title, instructions, done_w
     The task text goes in through `codex queue --thread`, the same path as an Orch wake-up. Whether that wakes a
     thread whose turn has ended is unverified. ack/progress/ask/report come back through the orchd CLI."""
     if not isinstance(desktop_thread, str) or not DESKTOP_THREAD_RE.fullmatch(desktop_thread):
-        raise ValueError("desktop_thread must be 1-128 characters of letters, digits, '-' or '_'")
+        raise ValueError("desktop_thread must be 1-128 characters of letters, digits, '-' or '_', starting with a letter or digit")
     given = sorted(k for k, v in unsupported.items() if v is not None)
     if given:
         raise ValueError(f"backend desktop does not support {', '.join(given)}")

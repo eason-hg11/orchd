@@ -76,11 +76,18 @@ class DesktopBackendTest(unittest.TestCase):
         self.assertNotIn("Worktree:", text)
 
     def test_dispatch_requires_a_valid_thread_id(self):
-        for bad in (None, "", "   ", "a b", "x;rm -rf", "../x", "a" * 129):
+        for bad in (None, "", "   ", "a b", "x;rm -rf", "../x", "a" * 129,
+                    "--bad", "-x", "-", "_x", "ab\n", "ab\ncd", "a\tb", "\nab", "ab ", "é"):
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "desktop_thread"):
                 self.dispatch(thread=bad)
         self.assertEqual(self.rt.woken, [])
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+
+    def test_dispatch_accepts_boundary_thread_ids(self):
+        for ok in ("a", "0", "a" * 128, "ab-cd_ef", "a-"):
+            with self.subTest(ok=ok):
+                self.dispatch(thread=ok)
+                self.con.execute("UPDATE tasks SET status='done'")
 
     def test_desktop_thread_is_rejected_for_other_backends(self):
         with self.assertRaisesRegex(ValueError, "desktop_thread"):
